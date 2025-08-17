@@ -1,0 +1,226 @@
+// internal/game/policy_prune.go
+package game
+
+import (
+	"math"
+	"sort"
+)
+
+// 开关 & 策略参数（可以按需微调）
+var (
+	// 总开关：只要 true，就在根节点用 CNN policy 先验修剪
+	policyPruneEnabled = true
+
+	// 保留比例 + 下限/上限：keep = clamp(minKeep, int(len(moves)*keepRatio), maxKeep)
+	policyKeepRatio = 0.65
+	policyMinKeep   = 8
+	policyMaxKeep   = 32
+
+	// 如果想把保留下来的走法顺序也按 policy 排序供后续 α–β 使用
+	policyAlsoOrder = true
+)
+
+// 覆盖率阈值（基础值）；当熵高时会提高该阈值
+var policyCoverBase = 0.80
+var policyEntropyHigh = 3.0 // 熵阈值（经验），高于它认为不确定
+var policyCoverHigh = 0.90  // 不确定时更高的覆盖率
+var policyTemp = 1.0        // softmax 温度（>1 更平，<1 更尖）
+
+// 9x9 平面 index （不引入 ml 包，避免 import cycle）
+func toIndex9(b *Board, c HexCoord) int {
+	grid := 2*b.radius + 1 // radius=4 -> grid=9
+	return (c.R+b.radius)*grid + (c.Q + b.radius)
+}
+
+// 计算即时感染数（不改盘）
+func instantInfect(b *Board, mv Move, side CellState) int {
+	cnt := 0
+	for _, d := range Directions {
+		nb := mv.To.Add(d)
+		if b.Get(nb) == Opponent(side) {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func policyPruneRoot(b *Board, player CellState, moves []Move) []Move {
+	if !policyPruneEnabled || len(moves) <= policyMinKeep {
+		return moves
+	}
+
+	logits, err := PolicyNN(b, player) // 81 个logit（未softmax）
+	if err != nil || len(logits) != 81 {
+		return moves // 推理失败就不动
+	}
+
+	type rec struct {
+		mv    Move
+		logit float64
+		p     float64
+		inf   int
+	}
+	recs := make([]rec, 0, len(moves))
+
+	// 先收集每个合法走法的 logit 与“即时感染数”
+	maxLogit := -math.MaxFloat64
+	for _, m := range moves {
+		idx := toIndex9(b, m.To)
+		l := -1e30 // 越界/异常给予极小
+		if idx >= 0 && idx < len(logits) {
+			l = float64(logits[idx])
+		}
+		if l > maxLogit {
+			maxLogit = l
+		}
+		recs = append(recs, rec{
+			mv:    m,
+			logit: l,
+			inf:   instantInfect(b, m, player),
+		})
+	}
+
+	// 在“合法招法集合”上做 softmax，数值稳定化（减去 max）
+	// 可加温度以调尖/平
+	var sum float64
+	for i := range recs {
+		x := (recs[i].logit - maxLogit) / math.Max(policyTemp, 1e-6)
+		recs[i].p = math.Exp(x)
+		sum += recs[i].p
+	}
+	if sum == 0 {
+		// 退化：全等概率
+		u := 1.0 / float64(len(recs))
+		for i := range recs {
+			recs[i].p = u
+		}
+	} else {
+		inv := 1.0 / sum
+		for i := range recs {
+			recs[i].p *= inv
+		}
+	}
+
+	// 计算熵，决定覆盖率阈值自适应
+	var entropy float64
+	for _, r := range recs {
+		if r.p > 0 {
+			entropy -= r.p * math.Log(r.p+1e-12)
+		}
+	}
+	coverTarget := policyCoverBase
+	if entropy >= policyEntropyHigh {
+		coverTarget = policyCoverHigh
+	}
+
+	// 先按概率从大到小排
+	sort.Slice(recs, func(i, j int) bool { return recs[i].p > recs[j].p })
+
+	// 先构建白名单集合：即时感染>=3 的都保留
+	// 另外保证至少保留一手克隆 & 一手跳跃
+	keepSet := make(map[Move]struct{}, len(recs))
+	hasClone, hasJump := false, false
+	for _, r := range recs {
+		if r.inf >= 3 {
+			keepSet[r.mv] = struct{}{}
+			if r.mv.IsClone() {
+				hasClone = true
+			} else {
+				hasJump = true
+			}
+		}
+	}
+	// 如果白名单里没有克隆/跳跃，各补一个概率最高的
+	if !hasClone {
+		for _, r := range recs {
+			if r.mv.IsClone() {
+				keepSet[r.mv] = struct{}{}
+				break
+			}
+		}
+	}
+	if !hasJump {
+		for _, r := range recs {
+			if r.mv.IsJump() {
+				keepSet[r.mv] = struct{}{}
+				break
+			}
+		}
+	}
+
+	// 然后从高到低累加概率，直到覆盖率达标
+	cum := 0.0
+	for _, r := range recs {
+		if _, ok := keepSet[r.mv]; ok {
+			cum += r.p
+			continue
+		}
+		if cum >= coverTarget {
+			break
+		}
+		keepSet[r.mv] = struct{}{}
+		cum += r.p
+	}
+
+	// 应用 min/max/ratio 限制
+	kept := make([]rec, 0, len(recs))
+	for _, r := range recs {
+		if _, ok := keepSet[r.mv]; ok {
+			kept = append(kept, r)
+		}
+	}
+	// 如果太少/太多，按参数夹紧
+	want := int(float64(len(moves)) * policyKeepRatio)
+	if want < policyMinKeep {
+		want = policyMinKeep
+	}
+	if want > policyMaxKeep {
+		want = policyMaxKeep
+	}
+	if want < 1 {
+		want = 1
+	}
+	if want > len(recs) {
+		want = len(recs)
+	}
+	// 如果 kept 少于 want，则从剩余中按概率继续补满；多于 want 则截断
+	if len(kept) < want {
+		used := make(map[Move]struct{}, len(kept))
+		for _, r := range kept {
+			used[r.mv] = struct{}{}
+		}
+		for _, r := range recs {
+			if len(kept) >= want {
+				break
+			}
+			if _, ok := used[r.mv]; !ok {
+				kept = append(kept, r)
+			}
+		}
+	} else if len(kept) > want {
+		kept = kept[:want]
+	}
+
+	// 输出
+	out := make([]Move, len(kept))
+	for i := range kept {
+		out[i] = kept[i].mv
+	}
+
+	// 是否也用 policy 顺序喂给 α–β
+	if policyAlsoOrder {
+		return out
+	}
+	// 只修剪，不改原始顺序
+	keepMap := make(map[Move]struct{}, len(out))
+	for _, m := range out {
+		keepMap[m] = struct{}{}
+	}
+	final := out[:0]
+	for _, m := range moves {
+		if _, ok := keepMap[m]; ok {
+			final = append(final, m)
+		}
+	}
+	return final
+}
