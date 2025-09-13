@@ -1,5 +1,7 @@
 package game
 
+import "fmt"
+
 // Move 表示一次从 From 到 To 的走子
 type Move struct {
 	From HexCoord
@@ -81,18 +83,30 @@ func (m Move) IsJumpOld() bool {
 	return false
 }
 func GenerateMoves(b *Board, player CellState) []Move {
-	var moves []Move
-	for _, from := range b.AllCoords() {
-		if b.Get(from) != player {
+	moves := make([]Move, 0, 64) // 预分配
+
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] != player {
 			continue
 		}
-		for _, to := range b.AllCoords() {
-			if b.Get(to) != Empty {
-				continue
+
+		// 克隆（距离=1）
+		for _, to := range NeighI[i] {
+			if b.Cells[to] == Empty {
+				moves = append(moves, Move{
+					From: CoordOf[i],
+					To:   CoordOf[to],
+				})
 			}
-			switch HexDist(from, to) {
-			case 1, 2:
-				moves = append(moves, Move{From: from, To: to})
+		}
+
+		// 跳跃（距离=2）
+		for _, to := range JumpI[i] {
+			if b.Cells[to] == Empty {
+				moves = append(moves, Move{
+					From: CoordOf[i],
+					To:   CoordOf[to],
+				})
 			}
 		}
 	}
@@ -100,62 +114,80 @@ func GenerateMoves(b *Board, player CellState) []Move {
 }
 
 // GenerateMoves 枚举玩家 player 在棋盘 b 上所有合法走法
-func GenerateMovesOld(b *Board, player CellState) []Move {
-	var moves []Move
-	// 遍历所有格子
-	for _, c := range b.AllCoords() {
-		if b.Get(c) != player {
-			continue
-		}
-		// 1) 复制走法：6 个方向
-		for _, d := range cloneDirs {
-			to := HexCoord{c.Q + d.Q, c.R + d.R}
-			if b.Get(to) == Empty {
-				moves = append(moves, Move{From: c, To: to})
-			}
-		}
-		// 2) 跳跃走法：12 个方向
-		for _, d := range jumpDirs {
-			to := HexCoord{c.Q + d.Q, c.R + d.R}
-			if b.Get(to) == Empty {
-				moves = append(moves, Move{From: c, To: to})
-			}
-		}
-	}
-	return moves
-}
+//func GenerateMovesOld(b *Board, player CellState) []Move {
+//	var moves []Move
+//	// 遍历所有格子
+//	for _, c := range b.AllCoords() {
+//		if b.Get(c) != player {
+//			continue
+//		}
+//		// 1) 复制走法：6 个方向
+//		for _, d := range cloneDirs {
+//			to := HexCoord{c.Q + d.Q, c.R + d.R}
+//			if b.Get(to) == Empty {
+//				moves = append(moves, Move{From: c, To: to})
+//			}
+//		}
+//		// 2) 跳跃走法：12 个方向
+//		for _, d := range jumpDirs {
+//			to := HexCoord{c.Q + d.Q, c.R + d.R}
+//			if b.Get(to) == Empty {
+//				moves = append(moves, Move{From: c, To: to})
+//			}
+//		}
+//	}
+//	return moves
+//}
 
 // 1) 把 Apply 改成返回被感染的坐标切片
+// Move.Apply —— 在棋盘上执行一步棋：克隆或跳跃 + 邻居感染
+// 返回：本步被感染的格子（HexCoord 列表），以及可能的错误（越界/占用/起点不对等）
+//
+// 依赖：indexOf、coordOf、neighI、b.setI、Opponent 等均已初始化
 func (m Move) Apply(b *Board, player CellState) ([]HexCoord, error) {
-	// Validate & execute move 同旧逻辑……
-	// （略）
+	// —— 坐标 → 下标 —— //
+	toIdx, okTo := IndexOf[m.To]
+	fromIdx, okFrom := IndexOf[m.From]
+	if !okTo || !okFrom {
+		return nil, fmt.Errorf("apply: coord out of board (from=%v ok=%v, to=%v ok=%v)", m.From, okFrom, m.To, okTo)
+	}
 
-	// 先收集原始棋盘上哪些邻居是对手
+	// —— 基本合法性校验（按你原逻辑需要可增减）—— //
+	if b.Cells[fromIdx] != player {
+		return nil, fmt.Errorf("apply: from is not player's piece")
+	}
+	if b.Cells[toIdx] != Empty {
+		return nil, fmt.Errorf("apply: destination not empty")
+	}
+	// 如需严格校验“是否真的是克隆/跳跃目的地”，可加：
+	//   - 克隆：toIdx 必须在 neighI[fromIdx] 中
+	//   - 跳跃：toIdx 必须在 jumpI[fromIdx] 中
+	// 这里按“调用方保证合法走法”处理，省分支
+
 	opp := Opponent(player)
-	var toBeInfected []HexCoord
-	for _, n := range b.Neighbors(m.To) {
-		if b.Get(n) == opp {
-			toBeInfected = append(toBeInfected, n)
+
+	// —— 预先收集将被感染的邻居（以索引存一份，返回时也要 HexCoord）—— //
+	infectedIdx := make([]int, 0, 6)
+	infected := make([]HexCoord, 0, 6)
+	for _, nb := range NeighI[toIdx] {
+		if b.Cells[nb] == opp {
+			infectedIdx = append(infectedIdx, nb)
+			infected = append(infected, CoordOf[nb])
 		}
 	}
 
-	// 然后再去改棋盘：jump/clone + 放置新棋子
+	// —— 执行跳跃/克隆 —— //
 	if m.IsJump() {
-		if err := b.Set(m.From, Empty); err != nil {
-			return nil, err
-		}
+		b.setI(fromIdx, Empty)
 	}
-	if err := b.Set(m.To, player); err != nil {
-		return nil, err
+	b.setI(toIdx, player)
+
+	// —— 执行感染 —— //
+	for _, nb := range infectedIdx {
+		b.setI(nb, player)
 	}
 
-	// 最后真正“感染”那些被收集到的格子
-	for _, n := range toBeInfected {
-		if err := b.Set(n, player); err != nil {
-			return toBeInfected, err
-		}
-	}
-	return toBeInfected, nil
+	return infected, nil
 }
 
 func HexDist(a, b HexCoord) int {

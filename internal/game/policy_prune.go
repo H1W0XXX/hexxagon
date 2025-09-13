@@ -12,19 +12,19 @@ var (
 	policyPruneEnabled = true
 
 	// 保留比例 + 下限/上限：keep = clamp(minKeep, int(len(moves)*keepRatio), maxKeep)
-	policyKeepRatio = 0.65
-	policyMinKeep   = 8
-	policyMaxKeep   = 32
+	policyKeepRatio = 0.8
+	policyMinKeep   = 16
+	policyMaxKeep   = 48
 
 	// 如果想把保留下来的走法顺序也按 policy 排序供后续 α–β 使用
 	policyAlsoOrder = true
 )
 
 // 覆盖率阈值（基础值）；当熵高时会提高该阈值
-var policyCoverBase = 0.80
-var policyEntropyHigh = 3.0 // 熵阈值（经验），高于它认为不确定
-var policyCoverHigh = 0.90  // 不确定时更高的覆盖率
-var policyTemp = 1.0        // softmax 温度（>1 更平，<1 更尖）
+var policyCoverBase = 0.90
+var policyEntropyHigh = 2.2 // 熵阈值（经验），高于它认为不确定
+var policyCoverHigh = 0.96  // 不确定时更高的覆盖率
+var policyTemp = 1.1        // softmax 温度（>1 更平，<1 更尖）
 
 // 9x9 平面 index （不引入 ml 包，避免 import cycle）
 func toIndex9(b *Board, c HexCoord) int {
@@ -35,9 +35,13 @@ func toIndex9(b *Board, c HexCoord) int {
 // 计算即时感染数（不改盘）
 func instantInfect(b *Board, mv Move, side CellState) int {
 	cnt := 0
-	for _, d := range Directions {
-		nb := mv.To.Add(d)
-		if b.Get(nb) == Opponent(side) {
+	toIdx, ok := IndexOf[mv.To]
+	if !ok {
+		return 0 // 非法坐标
+	}
+	opp := Opponent(side)
+	for _, nb := range NeighI[toIdx] {
+		if b.Cells[nb] == opp {
 			cnt++
 		}
 	}

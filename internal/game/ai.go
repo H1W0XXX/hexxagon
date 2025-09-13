@@ -2,7 +2,6 @@
 package game
 
 import (
-	"fmt"
 	//"fmt"
 	"math"
 	"math/rand"
@@ -25,168 +24,219 @@ const jumpMovePenalty = 25
 // ------------------------------------------------------------
 // 公共入口
 // ------------------------------------------------------------
+// 用对象池拿一块 Board，然后把当前盘面“整块拷贝”过去。
+// 注意：array 赋值是深拷贝，O(37)；比逐个 map 复制快多了。
 func cloneBoardPool(b *Board) *Board {
-	nb := acquireBoard(b.radius)
-	// —— 确保 cells map 已初始化且已清空 ——
-	if nb.cells == nil {
-		nb.cells = make(map[HexCoord]CellState, len(b.cells))
-	} else {
-		for k := range nb.cells {
-			delete(nb.cells, k)
-		}
-	}
-	// 复制 cells 数据
-	for c, s := range b.cells {
-		nb.cells[c] = s
-	}
-	// 同步 hash
+	nb := acquireBoard(b.radius) // 已清空并重置 hash/标记
+	// 直接结构字段拷贝（array 是值拷贝）
+	nb.Cells = b.Cells
 	nb.hash = b.hash
+
+	nb.LastMove = b.LastMove
+	nb.LastMover = b.LastMover
+	nb.LastInfect = b.LastInfect
 	return nb
 }
 
+// 分配一块新的 Board，做一次性拷贝。
+// 若你在根并行的 worker 内部“只克隆一次后复用”，也可以用这个。
 func cloneBoard(b *Board) *Board {
-	// 分配全新的 map，绝不复用
 	nb := &Board{
-		radius: b.radius,
-		cells:  make(map[HexCoord]CellState, len(b.cells)),
-		hash:   b.hash,
-	}
-	for c, s := range b.cells {
-		nb.cells[c] = s
+		radius:     b.radius,
+		Cells:      b.Cells, // 数组值拷贝
+		hash:       b.hash,
+		LastMove:   b.LastMove,
+		LastMover:  b.LastMover,
+		LastInfect: b.LastInfect,
 	}
 	return nb
 }
 
-func FindBestMoveAtDepth(b *Board, player CellState, depth int, allowJump bool) (Move, bool) {
-	ttProbeCount = 0
-	ttHitCount = 0
+func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool) (Move, bool) {
 
-	if mv, ok := findImmediateWinOrSafeClone(b, player); ok {
+	// 统计 TT（可选）
+	//ttProbeCount = 0
+	//ttHitCount = 0
+
+	// 0) 快速挖胜/保胜（仅克隆→避免被反超的跳）
+	if mv, ok := findImmediateWinOnly(b, player); ok {
 		return mv, true
 	}
+
+	// 1) 生成根走法
 	moves := GenerateMoves(b, player)
 	if len(moves) == 0 {
 		return Move{}, false
 	}
 
-	// 计算空位比例 r（开局判断）
-	coords := b.AllCoords()
+	// 2) 根层一次性计算空位比例 r
+	total := len(b.AllCoords())
 	empties := 0
-	for _, c := range coords {
-		if b.Get(c) == Empty {
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] == Empty {
 			empties++
 		}
 	}
-	r := float64(empties) / float64(len(coords))
+	r := float64(empties) / float64(total)
 
-	// --- 开局极早期强制只克隆（优先外圈） ---
-	const earlyCloneThresh = 0.84 // 开得更稳就再调大一点
+	// 3) 开局极早期：只保留“外圈克隆”
+	const earlyCloneThresh = 0.84
 	if r >= earlyCloneThresh {
-		var edgeClones []Move
+		edgeClones := make([]Move, 0, len(moves))
 		for _, m := range moves {
-			if m.IsClone() && isOuter(m.To, b.radius) {
+			if !m.IsClone() {
+				continue
+			}
+			if idx, ok := IndexOf[m.To]; ok && isOuterI[idx] {
 				edgeClones = append(edgeClones, m)
 			}
 		}
-		moves = edgeClones
+		if len(edgeClones) > 0 {
+			moves = edgeClones
+		}
 	}
 
-	// 开局规则之后，再按 UI 的 allowJump 做“禁跳”门控
+	// 4) UI 门控禁跳
 	moves = filterJumpsByFlag(b, player, moves, allowJump)
 
-	// 根节点过滤“0 感染跳跃”，若全被剔空则回退到保留克隆
-	moves = filterLowInfectJumpsOrFallback(b, player, moves, 2)
+	// 5) 根层启发式过滤：剔除0感染跳 & 危险跳跃 & 危险克隆
+	moves = filterLowInfectJumpsOrFallback(b, player, moves, 1)
+	moves = filterDangerousRecaptureJumps(b, player, moves)
 	moves = filterDangerousIsolatedClones(b, player, moves)
 	if len(moves) == 0 {
-		fmt.Printf("0 感染跳跃全被剔空")
 		return Move{}, false
 	}
 
-	// policy 先验修剪（可选）
+	// 6) policy 先验修剪（可选）
 	if pruned := policyPruneRoot(b, player, moves); len(pruned) > 0 {
 		moves = pruned
 	}
 
-	// -------- 粗评分排序（保持你原来的代码）--------
+	// 7) 根层粗评分排序（零分配 make/unmake）
 	type scored struct {
 		mv    Move
 		score int
 	}
 	order := make([]scored, len(moves))
 	for i, m := range moves {
-		origHash := b.hash
 		undo := mMakeMoveWithUndo(b, m, player)
-		var score int
-		if useLearned {
-			score = EvaluateNN(b, player)
-		} else {
-			score = evaluateStatic(b, player)
-		}
+		s := func() int {
+			if useLearned {
+				return EvaluateNN(b, player)
+			}
+			return evaluateStatic(b, player)
+		}()
+		// 轻量启发：感染数加权，能明显稳定排序（尤其早中期）
+		inf := previewInfectedCount(b, m, player)
+		s += 3 * inf
+
 		b.UnmakeMove(undo)
-		b.hash = origHash
-		order[i] = scored{m, score}
+
+		// 只在根层，对我方跳跃降权（递归里保持中立）
+		if !useLearned && m.IsJump() {
+			s -= jumpMovePenalty
+		}
+
+		order[i] = scored{mv: m, score: s}
 	}
+
 	sort.Slice(order, func(i, j int) bool {
 		if order[i].score != order[j].score {
 			return order[i].score > order[j].score
 		}
+		// 同分优先克隆更稳（建议保留）
 		if order[i].mv.IsClone() != order[j].mv.IsClone() {
 			return order[i].mv.IsClone()
 		}
 		return false
 	})
 
-	// -------- 并行 α–β（保持你原来的代码，只是把 allowJump 传下去）--------
+	// 8) 根并行：固定 worker pool，每 worker 仅克隆一次并复用棋盘
 	const inf = 1 << 30
 	type result struct {
 		mv    Move
 		score int
 	}
-	resCh := make(chan result, len(order))
+
+	jobs := make(chan Move, len(order))
+	results := make(chan result, len(order))
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(order) {
+		workers = len(order)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
 	var wg sync.WaitGroup
+	wg.Add(workers)
+
 	alphaRoot, betaRoot := -inf, inf
 
-	for _, item := range order {
-		wg.Add(1)
-		go func(it scored) {
+	for w := 0; w < workers; w++ {
+		go func() {
 			defer wg.Done()
-			nb := cloneBoardPool(b)
-			nb.LastMove = Move{}
-			_ = mMakeMoveWithUndo(nb, it.mv, player)
-			score := alphaBeta(nb, nb.hash, Opponent(player), player, depth-1, alphaRoot, betaRoot, allowJump)
-			releaseBoard(nb)
-			resCh <- result{it.mv, score}
-		}(item)
-	}
-	wg.Wait()
-	close(resCh)
+			// 只做一次 O(N) 克隆，其余走法复用 + 回溯
+			nb := cloneBoard(b) // 如使用对象池，也可改为 cloneBoardPool(b)/releaseBoard(nb)
+			defer func() {
+				// 如果是 cloneBoardPool(b)，这里改为 releaseBoard(nb)
+				_ = nb
+			}()
 
-	bestScore := -inf
-	secondScore := -inf
-	var bestMoves []Move
-	for r := range resCh {
-		score := r.score
-		if score > bestScore {
+			for mv := range jobs {
+				undo := mMakeMoveWithUndo(nb, mv, player)
+				score := alphaBeta(nb, 0, Opponent(player), player, depth-1, alphaRoot, betaRoot, true)
+				nb.UnmakeMove(undo)
+				results <- result{mv: mv, score: score}
+			}
+		}()
+	}
+
+	for _, it := range order {
+		jobs <- it.mv
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// 9) 汇总最优解（同分优先克隆；差距小做轻随机）
+	bestScore, secondScore := -inf, -inf
+	bestMoves := make([]Move, 0, 4)
+
+	for r := range results {
+		s := r.score
+		if s > bestScore {
 			secondScore = bestScore
-			bestScore = score
-			bestMoves = []Move{r.mv}
-		} else if score > secondScore && score < bestScore {
-			secondScore = score
-		} else if score == bestScore {
+			bestScore = s
+			bestMoves = bestMoves[:0]
 			bestMoves = append(bestMoves, r.mv)
+		} else if s == bestScore {
+			bestMoves = append(bestMoves, r.mv)
+		} else if s > secondScore {
+			secondScore = s
 		}
+	}
+
+	if len(bestMoves) == 0 {
+		return Move{}, false
 	}
 
 	// 同分优先克隆
-	var cloneMoves []Move
-	for _, m := range bestMoves {
-		if m.IsClone() {
-			cloneMoves = append(cloneMoves, m)
-		}
-	}
-	if len(cloneMoves) > 0 {
-		bestMoves = cloneMoves
-	}
+	//if len(bestMoves) > 1 {
+	//	clones := bestMoves[:0]
+	//	for _, m := range bestMoves {
+	//		if m.IsClone() {
+	//			clones = append(clones, m)
+	//		}
+	//	}
+	//	if len(clones) > 0 {
+	//		bestMoves = clones
+	//	}
+	//}
 
 	choice := bestMoves[0]
 	if len(bestMoves) > 1 && bestScore-secondScore < 3 {
@@ -199,50 +249,62 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int, allowJump bool) 
 // α-β + 置换表
 // ------------------------------------------------------------
 func mMakeMoveWithUndo(b *Board, mv Move, player CellState) undoInfo {
-	// 确保评估能看到“刚才这步”
+	u := undoInfo{
+		prevLastMove:   b.LastMove,
+		prevLastMover:  b.LastMover,
+		prevLastInfect: b.LastInfect,
+	}
 	b.LastMove = mv
-
-	infectedCoords, u := mv.MakeMove(b, player)
+	infected, inner := mv.MakeMove(b, player) // 这里会改 cells/hash
 	b.LastMover = player
-	b.LastInfect = len(infectedCoords)
+	b.LastInfect = len(infected)
+	u.changed = inner.changed
 	return u
 }
 
+// alphaBeta —— 统一使用 Make/Unmake 维护 b.hash；TT 键 = b.hash ^ sideKey(current)
+// 说明：第二个参数 hash 已弃用，这里命名为 "_" 以避免未使用报错。
 func alphaBeta(
 	b *Board,
-	hash uint64,
+	_ uint64, // 已弃用：不再手搓 childHash；保留签名以减少你其它调用处的改动
 	current, original CellState,
-	depth, alpha, beta int,
+	depth int64,
+	alpha, beta int,
 	allowJump bool,
 ) int {
-	// ———— 新增 —— 在函数开头，先计算空位比例 r，用于判断是否处于“开局前期” ————
-	coords := b.AllCoords()
-	empties := 0
-	for _, c := range coords {
-		if b.Get(c) == Empty {
-			empties++
-		}
-	}
-	//r := float64(empties) / float64(len(coords))
-	// ————————————————————————————————————————————————————————————————
-
-	// 1) 生成所有走法
+	// 1) 走法生成（含 UI 禁跳）
 	moves := GenerateMoves(b, current)
 	moves = filterJumpsByFlag(b, current, moves, allowJump)
-	// 2) 叶节点或无走子：直接评估，并写入置换表
+
 	if depth == 0 || len(moves) == 0 {
-		var val int
+		// original 视角的评估（和你原来一致）
+		var valOrig int
 		if useLearned {
-			val = EvaluateNN(b, original)
+			valOrig = EvaluateNN(b, original)
 		} else {
-			val = evaluateStatic(b, original)
+			valOrig = evaluateStatic(b, original)
 		}
-		storeTT(hash, depth, val, ttExact)
-		return val
+
+		// 存 TT 用 current 视角（与 key 里的 current 对齐）
+		valTT := valOrig
+		if current != original {
+			valTT = -valOrig
+		}
+		ttKey := ttKeyFor(b, current)
+		storeTT(ttKey, int(depth), valTT, ttExact)
+
+		// 返回仍用 original 视角
+		return valOrig
 	}
 
-	// 3) 置换表探测
-	if hit, val, flag := probeTT(hash, depth); hit {
+	// 3) 置换表探测（混入 side）
+	ttKey := ttKeyFor(b, current)
+	if hit, valCur, flag := probeTT(ttKey, int(depth)); hit {
+		// valCur 是 current 视角；转回 original
+		val := valCur
+		if current != original {
+			val = -valCur
+		}
 		switch flag {
 		case ttExact:
 			return val
@@ -259,93 +321,36 @@ func alphaBeta(
 			return val
 		}
 	}
-	alphaOrig := alpha
-	betaOrig := beta
+	alphaOrig, betaOrig := alpha, beta
 
-	// 4) PV-Move 排序：如果置换表里有记录的最佳走法索引，把它交换到 moves[0]
-	if ok, idx := probeBestIdx(hash); ok {
+	// 4) 如果 TT 里存了该节点的最佳索引，交换到首位以提升剪枝效率
+	if ok, idx := probeBestIdx(ttKey); ok {
 		i := int(idx)
-		if i < len(moves) {
+		if i >= 0 && i < len(moves) {
 			moves[0], moves[i] = moves[i], moves[0]
 		}
 	}
 
+	// 5) 极大/极小节点搜索
 	var bestScore int
 	var bestIdx uint8
 
-	// 5) 根据是“极大化节点”还是“极小化节点”分别处理
 	if current == original {
 		// === MAX 节点 ===
 		bestScore = math.MinInt32
 
-		// ———— 新增：过滤开局阶段 0 感染跳跃 ————
-		var filtered []Move
-		for _, mv := range moves {
-			//if r >= openingPhaseThresh && mv.IsJump() && previewInfectedCount(b, mv, current) == 0 {
-			if mv.IsJump() && previewInfectedCount(b, mv, current) == 0 {
-				// 跳跃但0感染，丢弃
-				continue
-			}
-			filtered = append(filtered, mv)
-		}
-		moves = filtered
-		// 如果全部走法都被过滤，回退到原始走法列表，避免空搜索
-		//if len(moves) == 0 {
-		//	moves = GenerateMoves(b, current)
-		//}
-		// ——————————————————————————————
-
-		// PV-Move 排序：置换表里记录的最佳索引先尝试
-		if ok, idx := probeBestIdx(hash); ok {
-			i := int(idx)
-			if i < len(moves) {
-				moves[0], moves[i] = moves[i], moves[0]
-			}
-		}
-
-		// 遍历剩余走法
 		for i, mv := range moves {
-			// 计算增量 Zobrist hash
-			origHash := b.hash
-			childHash := origHash ^ zobristSide[sideIdx(current)]
-
-			// from → Empty（若跳跃则额外清除原位）
-			childHash ^= zobristKey(mv.From, current)
-			if mv.IsJump() {
-				childHash ^= zobristKey(mv.From, Empty)
-			}
-			// to → current
-			childHash ^= zobristKey(mv.To, Empty)
-			childHash ^= zobristKey(mv.To, current)
-			// 感染翻转
-			for _, n := range b.Neighbors(mv.To) {
-				if b.Get(n) == Opponent(current) {
-					childHash ^= zobristKey(n, Opponent(current))
-					childHash ^= zobristKey(n, current)
-				}
-			}
-			// 切换行棋方
-			next := Opponent(current)
-			childHash ^= zobristSide[sideIdx(next)]
-			// 更新棋盘 hash
-			b.hash = childHash
-
-			// 真正落子
 			undo := mMakeMoveWithUndo(b, mv, current)
 
-			// 递归搜索
-			score := alphaBeta(b, childHash, next, original, depth-1, alpha, beta, allowJump)
+			score := alphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump)
 
-			// 回溯
 			b.UnmakeMove(undo)
-			b.hash = origHash
 
-			// （可选）对所有跳跃加上固定惩罚，比如 jumpMovePenalty
-			if mv.IsJump() && !useLearned {
-				score -= jumpMovePenalty
-			}
+			// 可选：对跳跃加一个固定惩罚，与你现有逻辑一致
+			//if mv.IsJump() && !useLearned {
+			//	score -= jumpMovePenalty
+			//}
 
-			// 更新 bestScore / α / β-剪枝
 			if score > bestScore {
 				bestScore = score
 				bestIdx = uint8(i)
@@ -360,58 +365,33 @@ func alphaBeta(
 	} else {
 		// === MIN 节点 ===
 		bestScore = math.MaxInt32
+
 		for i, mv := range moves {
-			// 如果你只想给 MAX 侧惩罚，那么这里可以不做任何改动；否则下面也可以照着 MAX 的做法—给 MIN 侧的“非感染跳跃”一个很高的分数，使 MIN 不愿意选它。
-			// 通常我们只对 MAX 侧进行“非感染跳跃惩罚”，所以这里不加惩罚判断——保持原样即可。
-
-			childHash := hash
-			// ★ 0) 去掉当前行棋方
-			childHash ^= zobristSide[sideIdx(current)]
-
-			// ①–⑤ 增量 XOR 格子状态
-			childHash ^= zobristKey(mv.From, current)
-
-			//if mv.IsJump() {
-			//	childHash = childHash ^ zobristKey(mv.From, current) ^ zobristKey(mv.From, Empty)
-			//}
-			next := Opponent(current)
-			childHash ^= zobristSide[sideIdx(next)] // ★ 新增
-
-			childHash = childHash ^ zobristKey(mv.To, Empty) ^ zobristKey(mv.To, current)
-
-			// 执行落子并记录 undo
 			undo := mMakeMoveWithUndo(b, mv, current)
 
-			// 递归
-			score := alphaBeta(b, childHash, Opponent(current), original, depth-1, alpha, beta, allowJump)
+			score := alphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump)
 
-			// 回溯
 			b.UnmakeMove(undo)
 
-			if mv.IsJump() {
-				if !useLearned {
-					// 由于 MIN 节点是在找最小 score，所以想让它不喜欢跳，就给它加一个很大的正分：
-					score += jumpMovePenalty
-				}
+			// 与你现有逻辑一致：如果也想让 MIN 讨厌跳跃，就加正分
+			//if mv.IsJump() && !useLearned {
+			//	score += jumpMovePenalty
+			//}
 
-			}
-
-			// 更新 best, β, 剪枝
 			if score < bestScore {
 				bestScore = score
 				bestIdx = uint8(i)
 			}
 			if score < beta {
 				beta = score
-			}
-			if beta <= alpha {
-				// 触发 α-剪枝
-				break
+				if beta <= alpha {
+					break
+				}
 			}
 		}
 	}
 
-	// 6) 写回置换表
+	// 6) 写回置换表（注意 flag 的 α/β 比较用原始窗口）
 	var flag ttFlag
 	switch {
 	case bestScore <= alphaOrig:
@@ -421,8 +401,15 @@ func alphaBeta(
 	default:
 		flag = ttExact
 	}
-	storeTT(hash, depth, bestScore, flag)
-	storeBestIdx(hash, bestIdx)
+
+	// bestScore 是 original 视角；转成 current 再存
+	valTT := bestScore
+	if current != original {
+		valTT = -bestScore
+	}
+	storeTT(ttKey, int(depth), valTT, flag)
+	storeBestIdx(ttKey, bestIdx)
+
 	return bestScore
 }
 
@@ -443,73 +430,48 @@ func min(a, b int) int {
 func chooseEndgameDepth(b *Board, base int) int {
 	// 统计空格
 	empties := 0
-	for _, c := range b.AllCoords() {
-		if b.Get(c) == Empty {
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] == Empty {
 			empties++
 		}
 	}
 	switch {
 	case empties <= 6:
 		// 残局很小，基本可以搜到底（每回合至少占/改变1格，给点冗余）
-		return base + 1
+		return base + 4
 	case empties <= 10:
-		return base + 1
+		return base + 2
 	//case empties <= 14:
 	//	return base + 2
 	default:
 		return base
 	}
 }
-func findImmediateWinOrSafeClone(b *Board, p CellState) (Move, bool) {
+
+func findImmediateWinOnly(b *Board, p CellState) (Move, bool) {
 	op := Opponent(p)
-	best := Move{}
-	found := false
-
 	for _, mv := range GenerateMoves(b, p) {
-		// 只考虑克隆（你就想防“跳了被反超”）
-		if !mv.IsClone() {
-			continue
-		}
+		undo := mMakeMoveWithUndo(b, mv, p)
 
-		nb := cloneBoard(b)
-		nb.LastMove = mv
-		_, _ = mv.MakeMove(nb, p)
-
-		// 1) 立即终局 = 对手无棋 or 无空格：直接选
 		empties := 0
-		for _, c := range nb.AllCoords() {
-			if nb.Get(c) == Empty {
+		for i := 0; i < BoardN; i++ {
+			if b.Cells[i] == Empty {
 				empties++
 			}
 		}
-		if len(GenerateMoves(nb, op)) == 0 || empties == 0 {
+		noOpp := len(GenerateMoves(b, op)) == 0
+		b.UnmakeMove(undo)
+
+		if noOpp || empties == 0 {
 			return mv, true
 		}
-
-		// 2) “一手后仍领先”的保胜：我方子数差 > 对手下一手最大感染
-		my := nb.CountPieces(p)
-		his := nb.CountPieces(op)
-		diff := my - his
-		// 估计对手下一手最多能吃多少（即时感染最大值）
-		opMaxEat := 0
-		for _, omv := range GenerateMoves(nb, op) {
-			eat := previewInfectedCount(nb, omv, op)
-			if eat > opMaxEat {
-				opMaxEat = eat
-			}
-		}
-		if diff > opMaxEat {
-			best = mv
-			found = true
-			// 不 return：继续找有没有“更好”的（可直接 return 也行）
-		}
 	}
-	return best, found
+	return Move{}, false
 }
 
 func DeepSearch(b *Board, hash uint64, side CellState, depth int) int {
 
-	return alphaBeta(b, hash, side, side, depth, -32000, 32000, true)
+	return alphaBeta(b, hash, side, side, int64(depth), -32000, 32000, true)
 }
 
 func IterativeDeepening(
@@ -519,27 +481,22 @@ func IterativeDeepening(
 	allowJump bool,
 ) (best Move, bestScore int, ok bool) {
 
-	// 用于存上一层 PV 走法的哈希 → bestIdx
-	pvMove := make(map[uint64]uint8)
-
 	for depth := 1; depth <= maxDepth; depth++ {
-		// 把上一层保存的 PV-Move 写进 TT，供排序
-		for h, idx := range pvMove {
-			storeBestIdx(h, idx)
-		}
-		// 调用已有的并行根节点搜索
-		depth2 := chooseEndgameDepth(root, depth)
-		mv, hit := FindBestMoveAtDepth(root, player, depth2, allowJump)
+		// 用“根节点的 TT key”写入 bestIdx 提示（这里写 0 作用很有限，但至少 key 是对的）
+		storeBestIdx(ttKeyFor(root, player), 0)
+
+		// 残局加深
+		fullDepth := chooseEndgameDepth(root, depth)
+
+		// 根搜索
+		mv, hit := FindBestMoveAtDepth(root, player, int64(fullDepth), allowJump)
 		if !hit {
-			break // 无合法走法
+			break
 		}
-		// 记录本层 PV-Move：根节点 hash → idx=0
-		pvMove[root.hash] = 0
-		best, bestScore, ok = mv, 0, true // 根节点时 score 在内部已比较
+		best, bestScore, ok = mv, 0, true
 	}
 	return
 }
-
 func AlphaBeta(b *Board, player CellState, depth int) int {
 	// 1) 把“行棋方”也异或进哈希，确保置换表区分 Max/Min
 	initialHash := b.hash ^ zobristSide[sideIdx(player)]
@@ -550,7 +507,7 @@ func AlphaBeta(b *Board, player CellState, depth int) int {
 		initialHash,
 		Opponent(player), // current = 对手
 		player,           // original = 我方
-		depth,
+		int64(depth),
 		math.MinInt, // 初始 α
 		math.MaxInt, // 初始 β
 		true)
@@ -564,17 +521,13 @@ func AlphaBeta(b *Board, player CellState, depth int) int {
 // ------------------------------------------------------------
 // 对外包装器 —— 只要 3 个参数即可调用
 // ------------------------------------------------------------
-func AlphaBetaNoTT(b *Board, player CellState, depth int) int {
-	// 根节点先把“行棋方随机键” XOR 进去，保证 hash 正确
-	initialHash := hashBoard(b) ^ zobristSide[sideIdx(player)]
-	b.hash = initialHash
-
-	// 递归从对手开始（current），original = player
+func AlphaBetaNoTT(b *Board, player CellState, depth int64) int {
+	// 从对手开始递归（current），original = player
 	return alphaBetaNoTT(
 		b,
 		Opponent(player), // current
 		player,           // original
-		depth,
+		int(depth),
 		math.MinInt32,
 		math.MaxInt32,
 	)
@@ -661,6 +614,91 @@ func filterZeroInfectJumpsOrFallback(b *Board, side CellState, moves []Move) []M
 	return moves
 }
 
+// 过滤“跳跃且只感染1子，但对手可一手同时反吃落点+该子”的招法。
+// 保守起见：若全被删光，则回退原 moves。
+func filterDangerousRecaptureJumps(b *Board, me CellState, moves []Move) []Move {
+	op := Opponent(me)
+	out := make([]Move, 0, len(moves))
+
+	for _, mv := range moves {
+		// 只针对跳跃
+		if !mv.IsJump() {
+			out = append(out, mv)
+			continue
+		}
+		toIdx, ok := IndexOf[mv.To]
+		if !ok {
+			out = append(out, mv)
+			continue
+		}
+
+		// 统计“即时被你感染”的邻格（这里只关心 == 1 的情形）
+		inf := -1
+		for _, nb := range NeighI[toIdx] {
+			if b.Cells[nb] == op {
+				if inf == -1 {
+					inf = nb
+				} else {
+					inf = -2 // 多于1个
+					break
+				}
+			}
+		}
+		if inf != -1 && inf != -2 {
+			// inf == 单一被感染格的下标
+		} else {
+			// 0 或 >=2，不做这个危险判定（按你描述只针对“感染1子”）
+			out = append(out, mv)
+			continue
+		}
+
+		// 找“同时邻接 落点(toIdx) 和 被感染(inf) 的空位 x”
+		// 也就是 x ∈ Neigh(toIdx) ∩ Neigh(inf)
+		danger := false
+		for _, x := range NeighI[toIdx] {
+			if b.Cells[x] != Empty {
+				continue
+			}
+			// x 也必须邻接 inf
+			if !isNeighborI(inf, x) {
+				continue
+			}
+			// 对手下一手能到 x（克隆/跳），则这步判危险
+			if opponentCanReachNextI(b, op, x) {
+				danger = true
+				break
+			}
+		}
+
+		if !danger {
+			out = append(out, mv)
+		}
+	}
+
+	if len(out) == 0 {
+		return moves
+	}
+	return out
+}
+func opponentCanReachNextI(b *Board, op CellState, dst int) bool {
+	if b.Cells[dst] != Empty {
+		return false
+	}
+	// 克隆一步（邻接）
+	for _, from := range NeighI[dst] {
+		if b.Cells[from] == op {
+			return true
+		}
+	}
+	// 跳两步（距离2）
+	for _, from := range JumpI[dst] {
+		if b.Cells[from] == op {
+			return true
+		}
+	}
+	return false
+}
+
 // 删掉“感染数 < minInf”的跳越。例：minInf=2 => 删掉0和1感染跳越。
 // 若全删光，则至少保留所有克隆；再不行就原样返回，保证不至于无解。
 func filterLowInfectJumpsOrFallback(b *Board, side CellState, moves []Move, minInf int) []Move {
@@ -688,11 +726,15 @@ func filterLowInfectJumpsOrFallback(b *Board, side CellState, moves []Move, minI
 }
 
 func isIsolated(b *Board, who CellState, at HexCoord) bool {
-	if b.Get(at) != who {
+	i, ok := IndexOf[at]
+	if !ok {
+		return false // 越界
+	}
+	if b.Cells[i] != who {
 		return false
 	}
-	for _, d := range Directions {
-		if b.Get(HexCoord{at.Q + d.Q, at.R + d.R}) == who {
+	for _, j := range NeighI[i] {
+		if b.Cells[j] == who {
 			return false
 		}
 	}
@@ -736,8 +778,8 @@ func filterDangerousIsolatedClones(b *Board, me CellState, moves []Move) []Move 
 	// 只在开局/前中期更有意义，降低误杀：空位比例大时才启用
 	total := len(b.AllCoords())
 	empties := 0
-	for _, c := range b.AllCoords() {
-		if b.Get(c) == Empty {
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] == Empty {
 			empties++
 		}
 	}
@@ -758,14 +800,19 @@ func filterDangerousIsolatedClones(b *Board, me CellState, moves []Move) []Move 
 	}
 	return moves // 全被删光就回退
 }
-
 func opponentCanJumpTo(b *Board, op CellState, dst HexCoord) bool {
-	if b.Get(dst) != Empty {
+	// 坐标 -> 下标
+	to, ok := IndexOf[dst]
+	if !ok {
 		return false
 	}
-	for _, d := range jumpDirs {
-		from := HexCoord{dst.Q - d.Q, dst.R - d.R}
-		if b.InBounds(from) && b.Get(from) == op {
+	// 目标必须是空
+	if b.Cells[to] != Empty {
+		return false
+	}
+	// 任何一个“能跳到 to 的起点(from)”上有对手棋子即可
+	for _, from := range JumpI[to] {
+		if b.Cells[from] == op {
 			return true
 		}
 	}
@@ -773,12 +820,16 @@ func opponentCanJumpTo(b *Board, op CellState, dst HexCoord) bool {
 }
 
 func opponentCanCloneTo(b *Board, op CellState, dst HexCoord) bool {
-	if b.Get(dst) != Empty {
+	to, ok := IndexOf[dst]
+	if !ok {
 		return false
 	}
-	for _, d := range Directions {
-		from := HexCoord{dst.Q - d.Q, dst.R - d.R}
-		if b.InBounds(from) && b.Get(from) == op {
+	if b.Cells[to] != Empty {
+		return false
+	}
+	// 任何一个相邻格有对手棋子即可克隆到 to
+	for _, from := range NeighI[to] {
+		if b.Cells[from] == op {
 			return true
 		}
 	}

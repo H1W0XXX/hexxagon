@@ -35,10 +35,14 @@ func NewGameState(radius int) *GameState {
 	}
 	// 放置初始棋子
 	for _, c := range cornersA {
-		_ = b.Set(c, PlayerA)
+		if idx, ok := IndexOf[c]; ok {
+			b.setI(idx, PlayerA)
+		}
 	}
 	for _, c := range cornersB {
-		_ = b.Set(c, PlayerB)
+		if idx, ok := IndexOf[c]; ok {
+			b.setI(idx, PlayerB)
+		}
 	}
 
 	// 放置障碍物
@@ -48,7 +52,9 @@ func NewGameState(radius int) *GameState {
 		{0, -1},
 	}
 	for _, c := range centerBlocks {
-		_ = b.Set(c, Blocked)
+		if idx, ok := IndexOf[c]; ok {
+			b.setI(idx, Blocked)
+		}
 	}
 
 	// 构造 GameState
@@ -113,8 +119,8 @@ func NewGameState(radius int) *GameState {
 // updateScores 重新统计棋子数量，更新 ScoreA 和 ScoreB
 func (gs *GameState) updateScores() {
 	a, b := 0, 0
-	for _, coord := range gs.Board.AllCoords() {
-		switch gs.Board.Get(coord) {
+	for i := 0; i < BoardN; i++ {
+		switch gs.Board.Cells[i] {
 		case PlayerA:
 			a++
 		case PlayerB:
@@ -144,8 +150,8 @@ func (gs *GameState) MakeMove(m Move) ([]HexCoord, undoInfo, error) {
 	// 2) 更新子数 & 统计空格
 	gs.updateScores()
 	emptyCnt := 0
-	for _, c := range gs.Board.AllCoords() {
-		if gs.Board.Get(c) == Empty {
+	for i := 0; i < BoardN; i++ {
+		if gs.Board.Cells[i] == Empty {
 			emptyCnt++
 		}
 	}
@@ -204,8 +210,8 @@ func (gs *GameState) MakeMove(m Move) ([]HexCoord, undoInfo, error) {
 			// 如果是因为下一玩家无合法走法，将所有空格分配给当前玩家
 			totalCells := len(gs.Board.AllCoords())
 			blockedCnt := 0
-			for _, c := range gs.Board.AllCoords() {
-				if gs.Board.Get(c) == Blocked {
+			for i := 0; i < BoardN; i++ {
+				if gs.Board.Cells[i] == Blocked {
 					blockedCnt++
 				}
 			}
@@ -261,64 +267,61 @@ func (gs *GameState) Reset() {
 // 也只被单一方棋子（不含 Blocked）包围的空格区域填充给该包围方。
 func (gs *GameState) fillEnclosedRegions() {
 	radius := gs.Board.radius
-	visited := make(map[HexCoord]bool)
+	visited := make([]bool, BoardN)
 
-	for _, start := range gs.Board.AllCoords() {
+	for start := 0; start < BoardN; start++ {
 		// 只对未访问过且是空的格子做 BFS
-		if gs.Board.Get(start) != Empty || visited[start] {
+		if gs.Board.Cells[start] != Empty || visited[start] {
 			continue
 		}
 
-		// 准备做 BFS，把从 start 出发的这片“空格连通区域”都搜出来
-		queue := []HexCoord{start}
-		region := []HexCoord{start}
+		// BFS 初始化
+		queue := []int{start}
+		region := []int{start}
 		visited[start] = true
 
 		touchesBorder := false
-		borderStates := make(map[CellState]bool)
+		borderA, borderB := false, false // 代替 map[CellState]bool
 
 		for len(queue) > 0 {
 			cur := queue[0]
 			queue = queue[1:]
 
-			// 如果 cur 已经在最外圈（|Q|==radius 或 |R|==radius 或 |Q+R|==radius），
-			// 那么整个 region 就不算封闭区域了
-			if abs(cur.Q) == radius || abs(cur.R) == radius || abs(cur.Q+cur.R) == radius {
+			cq := CoordOf[cur].Q
+			cr := CoordOf[cur].R
+			if abs(cq) == radius || abs(cr) == radius || abs(cq+cr) == radius {
 				touchesBorder = true
 			}
 
-			// 枚举 6 个邻居
-			for _, nb := range gs.Board.Neighbors(cur) {
-				s := gs.Board.Get(nb)
+			for _, nb := range NeighI[cur] {
+				s := gs.Board.Cells[nb]
 				switch s {
 				case Empty:
-					// 相邻还是空格，就继续把它加入到 BFS
 					if !visited[nb] {
 						visited[nb] = true
 						queue = append(queue, nb)
 						region = append(region, nb)
 					}
 				case Blocked:
-					// 如果遇到障碍，不标记 touchesBorder，也不记在 borderStates 里
 					continue
-				case PlayerA, PlayerB:
-					// 遇到的是棋子，就把它记到 borderStates
-					borderStates[s] = true
+				case PlayerA:
+					borderA = true
+				case PlayerB:
+					borderB = true
 				}
 			}
 		}
 
-		// BFS 结束后，region 保存了 start 所在的整个空洞连通块
-		// 如果这片区域 没有连到外圈 (touchesBorder==false)
-		// 并且 只有一种棋子包围 (len(borderStates)==1)，那么就把 region 全部填给这一侧
-		if !touchesBorder && len(borderStates) == 1 {
+		// 检查区域是否封闭，且边界只有一种棋子
+		if !touchesBorder && (borderA != borderB) {
 			var owner CellState
-			for p := range borderStates {
-				owner = p
+			if borderA {
+				owner = PlayerA
+			} else {
+				owner = PlayerB
 			}
-			for _, c := range region {
-				// 把每个空格都设成 owner，并忽略错误
-				_ = gs.Board.Set(c, owner)
+			for _, idx := range region {
+				gs.Board.setI(idx, owner) // 用 setI 保证 hash 同步
 			}
 		}
 	}
@@ -326,9 +329,9 @@ func (gs *GameState) fillEnclosedRegions() {
 
 // claimAllEmpty 把棋盘上所有空格判给指定玩家。
 func (gs *GameState) claimAllEmpty(to CellState) {
-	for _, c := range gs.Board.AllCoords() {
-		if gs.Board.Get(c) == Empty {
-			_ = gs.Board.Set(c, to) // 忽略 error
+	for i := 0; i < BoardN; i++ {
+		if gs.Board.Cells[i] == Empty {
+			gs.Board.setI(i, to) // 用 setI 保证 hash 同步
 		}
 	}
 }

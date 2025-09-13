@@ -53,43 +53,46 @@ func Evaluate(b *Board, player CellState) int {
 	return evaluateStatic(b, player)
 }
 
-func isOuter(c HexCoord, radius int) bool {
-	ring := max3(abs(c.Q), abs(c.R), abs(c.Q+c.R))
-	return ring == radius // 最外一圈
+func isOuter(c HexCoord, _ int) bool {
+	idx, ok := IndexOf[c] // 你已有的“坐标 -> 下标”映射
+	if !ok {
+		return false
+	}
+	return isOuterI[idx]
 }
 
-func outerRingCoords(b *Board) []HexCoord {
-	var ring []HexCoord
-	for _, c := range b.AllCoords() {
-		if isOuter(c, b.radius) && b.Get(c) != Blocked {
-			ring = append(ring, c)
-		}
-	}
-	return ring
-}
+//func outerRingCoords(b *Board) []HexCoord {
+//	var ring []HexCoord
+//	for _, c := range b.AllCoords() {
+//		if isOuter(c, b.radius) && b.Get(c) != Blocked {
+//			ring = append(ring, c)
+//		}
+//	}
+//	return ring
+//}
 
-func compSizeAt(b *Board, start HexCoord, color CellState) int {
-	if b.Get(start) != color {
-		return 0
-	}
-	visited := make(map[HexCoord]bool, 16)
-	stack := []HexCoord{start}
-	visited[start] = true
-	size := 0
-	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		size++
-		for _, d := range cloneDirs {
-			nb := HexCoord{cur.Q + d.Q, cur.R + d.R}
-			if !visited[nb] && b.Get(nb) == color {
-				visited[nb] = true
-				stack = append(stack, nb)
-			}
-		}
-	}
-	return size
-}
+//func compSizeAt(b *Board, start HexCoord, color CellState) int {
+//	if b.Get(start) != color {
+//		return 0
+//	}
+//	visited := make(map[HexCoord]bool, 16)
+//	stack := []HexCoord{start}
+//	visited[start] = true
+//	size := 0
+//	for len(stack) > 0 {
+//		cur := stack[len(stack)-1]
+//		stack = stack[:len(stack)-1]
+//		size++
+//		for _, d := range cloneDirs {
+//			nb := HexCoord{cur.Q + d.Q, cur.R + d.R}
+//			if !visited[nb] && b.Get(nb) == color {
+//				visited[nb] = true
+//				stack = append(stack, nb)
+//			}
+//		}
+//	}
+//	return size
+//}
 
 // 判断一个连通分量是否包含“紧密三角形”
 // 判定：在分量内存在某个格 c，使得 c 的相邻两个“相邻方向”(i, i+1) 都在分量中
@@ -110,142 +113,180 @@ func hasTightTriangle(comp []HexCoord, compSet map[HexCoord]struct{}) bool {
 
 // 统计“包含至少一个紧密三角形”的连通块数量（每个块最多计 1）
 func countTriangleBlocks(b *Board, side CellState) int {
-	visited := make(map[HexCoord]bool)
+	visited := make([]bool, BoardN)
 	count := 0
 
-	for _, start := range b.AllCoords() {
-		if visited[start] || b.Get(start) != side {
+	for i := 0; i < BoardN; i++ {
+		if visited[i] || b.Cells[i] != side {
 			continue
 		}
-		// BFS 收集该分量
-		comp := make([]HexCoord, 0, 8)
-		st := []HexCoord{start}
-		visited[start] = true
-		for len(st) > 0 {
-			cur := st[len(st)-1]
-			st = st[:len(st)-1]
+		// —— BFS 收集该连通分量（同色、按 6 邻接）——
+		comp := make([]int, 0, 8)
+		stack := []int{i}
+		visited[i] = true
+
+		for len(stack) > 0 {
+			cur := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
 			comp = append(comp, cur)
-			for _, nb := range b.Neighbors(cur) {
-				// 若 Neighbors 已保证在盘内，inBounds 可省
-				if !inBounds(nb.Q, nb.R) {
-					continue
-				}
-				if visited[nb] || b.Get(nb) != side {
+
+			for _, nb := range NeighI[cur] {
+				if visited[nb] || b.Cells[nb] != side {
 					continue
 				}
 				visited[nb] = true
-				st = append(st, nb)
+				stack = append(stack, nb)
 			}
 		}
+
 		if len(comp) < 3 {
 			continue
 		}
-		// 建 set 做 O(1) 查询
-		compSet := make(map[HexCoord]struct{}, len(comp))
-		for _, c := range comp {
-			compSet[c] = struct{}{}
+
+		// —— 建一个该分量内的布尔集合，O(1) 判定 ——
+		inComp := make([]bool, BoardN)
+		for _, v := range comp {
+			inComp[v] = true
 		}
-		if hasTightTriangle(comp, compSet) {
+
+		// —— 是否存在“紧三角” ——
+		if hasTightTriangleI(comp, inComp) {
 			count++
 		}
 	}
 	return count
 }
 
+// 任意三点两两相邻即视为“紧三角”
+func hasTightTriangleI(comp []int, inComp []bool) bool {
+	for _, a := range comp {
+		// 枚举 a 的分量内邻居 b
+		for _, b := range NeighI[a] {
+			if !inComp[b] || b == a {
+				continue
+			}
+			// 在 a 的邻居里再找一个 c，要求 c 在分量内、且 b 与 c 也相邻
+			for _, c := range NeighI[a] {
+				if !inComp[c] || c == a || c == b {
+					continue
+				}
+				if isNeighborI(b, c) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 //	func evaluateStatic(b *Board, player CellState) int {
 //		op := Opponent(player)
 //		return b.CountPieces(player) - b.CountPieces(op)*3
 //	}
+
+const (
+	pieceW    = 10 // 子数差
+	edgeW     = 2  // 外圈差
+	triW      = 15 // “紧三角”差
+	mobilityW = 1  // 机动性（去重后的可走空位数）差
+	supportW  = 2  // 弱支撑惩罚（同色邻居≤1 的子数）差
+)
+
+func mobilityCount(b *Board, side CellState) int {
+	vis := make([]bool, BoardN)
+	cnt := 0
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] != side {
+			continue
+		}
+		for _, nb := range NeighI[i] {
+			if b.Cells[nb] == Empty && !vis[nb] {
+				vis[nb] = true
+				cnt++
+			}
+		}
+		for _, j := range JumpI[i] {
+			if b.Cells[j] == Empty && !vis[j] {
+				vis[j] = true
+				cnt++
+			}
+		}
+	}
+	return cnt
+}
+
+func weakSupportCount(b *Board, side CellState) int {
+	bad := 0
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] != side {
+			continue
+		}
+		same := 0
+		for _, nb := range NeighI[i] {
+			if b.Cells[nb] == side {
+				same++
+			}
+		}
+		if same <= 1 {
+			bad++
+		}
+	}
+	return bad
+}
+
 func evaluateStatic(b *Board, player CellState) int {
 	op := Opponent(player)
 
-	// —— 可调权重 —— //
-	const (
-		pieceW          = 5
-		edgeW           = 6
-		triW            = 6
-		cloneInfW       = 6 // 本步克隆感染权重
-		jumpInfW        = 2 // 本步跳越感染权重
-		weakJumpPenalty = 500
-	)
-
-	// 基础统计
-	coords := b.AllCoords()
+	// 子数差
 	myCnt, opCnt := 0, 0
-	for _, c := range coords {
-		switch b.Get(c) {
-		case player:
+	for i := 0; i < BoardN; i++ {
+		if b.Cells[i] == player {
 			myCnt++
-		case op:
+		}
+		if b.Cells[i] == op {
 			opCnt++
 		}
 	}
-
 	pieceScore := (myCnt - opCnt) * pieceW
 
-	myEdge := 0
-	for _, c := range coords {
-		if b.Get(c) == player && isOuter(c, b.radius) {
+	// 外圈差（差值！而不是只加我方）
+	myEdge, opEdge := 0, 0
+	for i := 0; i < BoardN; i++ {
+		if !isOuterI[i] {
+			continue
+		}
+		if b.Cells[i] == player {
 			myEdge++
 		}
+		if b.Cells[i] == op {
+			opEdge++
+		}
 	}
-	edgeScore := myEdge * edgeW
+	edgeScore := (myEdge - opEdge) * edgeW
 
-	// 仅三角加分
+	// 紧三角差（你已有的 countTriangleBlocks）
 	myTri := countTriangleBlocks(b, player)
 	opTri := countTriangleBlocks(b, op)
 	triangleScore := (myTri - opTri) * triW
 
-	// 弱跳越重罚（沿用你原先逻辑）
-	weakJumpScore := 0
-	if b.LastMove.IsJump() {
-		mover := b.Get(b.LastMove.To)
-		if mover == PlayerA || mover == PlayerB {
-			sameAdj := 0
-			for _, d := range cloneDirs {
-				nb := HexCoord{b.LastMove.To.Q + d.Q, b.LastMove.To.R + d.R}
-				if b.Get(nb) == mover {
-					sameAdj++
-				}
-			}
-			if sameAdj <= 1 {
-				if mover == player {
-					weakJumpScore -= weakJumpPenalty
-					//} else {
-					//	weakJumpScore += weakJumpPenalty
-				}
-			}
-		}
-	}
+	// 弱支撑差：我方“同色邻居≤1”的子越多越糟
+	//myWeak := weakSupportCount(b, player)
+	//opWeak := weakSupportCount(b, op)
+	//supportScore := (opWeak - myWeak) * supportW // 惩我方=负，惩对手=正
 
-	// ★ 本步真实感染得分（不看下一手潜力）
-	infNowScore := 0
-	if b.LastInfect > 0 && (b.LastMover == PlayerA || b.LastMover == PlayerB) {
-		w := jumpInfW
-		if b.LastMove.IsClone() {
-			w = cloneInfW
-		}
-		if b.LastMover == player {
-			infNowScore += b.LastInfect * w
-		} else {
-			infNowScore -= b.LastInfect * w
-		}
-	}
-
-	// —— 汇总 —— //
-	return pieceScore +
-		edgeScore +
-		triangleScore +
-		weakJumpScore +
-		infNowScore
+	return pieceScore + edgeScore + triangleScore
 }
 
 // “预览”一次感染数，而不实际修改棋盘
 func previewInfectedCount(b *Board, mv Move, player CellState) int {
+	to, ok := IndexOf[mv.To]
+	if !ok {
+		return 0
+	}
+	opp := Opponent(player)
 	count := 0
-	for _, dir := range Directions {
-		nb := mv.To.Add(dir)
-		if b.Get(nb) == Opponent(player) {
+	for _, nb := range NeighI[to] {
+		if b.Cells[nb] == opp {
 			count++
 		}
 	}
@@ -263,3 +304,13 @@ func addHex(a, b HexCoord) HexCoord { return HexCoord{Q: a.Q + b.Q, R: a.R + b.R
 //	// 回退：原 evaluateStatic
 //	return evaluateStatic(b, player)
 //}
+
+// 小工具：判断两个下标是否相邻（查 a 的 6 邻居表）
+func isNeighborI(a, b int) bool {
+	for _, x := range NeighI[a] {
+		if x == b {
+			return true
+		}
+	}
+	return false
+}

@@ -148,11 +148,13 @@ func encodeBoard(b *Board, me CellState, dst []float32) {
 			if !inBounds(q, r) {
 				continue
 			}
-			switch b.Get(HexCoord{Q: q, R: r}) {
-			case me:
-				dst[offMy+idx] = 1
-			case Opponent(me):
-				dst[offOpp+idx] = 1
+			for i := 0; i < BoardN; i++ {
+				switch b.Cells[i] {
+				case me:
+					dst[offMy+i] = 1
+				case Opponent(me):
+					dst[offOpp+i] = 1
+				}
 			}
 			dst[offMask+idx] = 1
 		}

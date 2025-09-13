@@ -2,7 +2,6 @@
 package game
 
 import (
-	"errors"
 	"sync"
 )
 
@@ -28,17 +27,26 @@ var Directions = []HexCoord{
 	{-1, 0}, {-1, 1}, {0, 1},
 }
 
+const boardRadius = 4
+const BoardN = 1 + 3*boardRadius*(boardRadius+1) // 预先按 AllCoords(3) 的顺序编号
 // Board represents a hexagonal board of a given radius.
 // Coordinates satisfying |q| <= radius, |r| <= radius, |q+r| <= radius are valid.
 type Board struct {
-	radius   int
-	cells    map[HexCoord]CellState
-	hash     uint64
-	LastMove Move
-
-	LastMover  CellState // 刚才这步是谁下的
-	LastInfect int       // 刚才这步实际感染数
+	radius     int
+	Cells      [BoardN]CellState // 定长数组
+	hash       uint64
+	LastMove   Move
+	LastMover  CellState
+	LastInfect int
 }
+
+var (
+	CoordOf [BoardN]HexCoord // index -> 坐标
+	IndexOf map[HexCoord]int // 坐标 -> index（仅入口/出口处用）
+	NeighI  [BoardN][]int    // 每个格子的 6 邻居下标
+	JumpI   [BoardN][]int    // 每个格子的跳跃可达下标（两格）
+	Coords  [BoardN]HexCoord
+)
 
 var boardPool = sync.Pool{
 	New: func() any {
@@ -47,68 +55,99 @@ var boardPool = sync.Pool{
 }
 
 var coordsCache = map[int][]HexCoord{} // 支持多半径
+var isOuterI [BoardN]bool
 
-func AllCoords(radius int) []HexCoord {
-	if coords, ok := coordsCache[radius]; ok {
-		return coords
-	}
-	var result []HexCoord
-	for q := -radius; q <= radius; q++ {
-		for r := -radius; r <= radius; r++ {
-			if abs(q)+abs(r)+abs(-q-r) <= 2*radius {
-				result = append(result, HexCoord{q, r})
+func init() {
+	IndexOf = make(map[HexCoord]int, BoardN)
+	i := 0
+	for q := -boardRadius; q <= boardRadius; q++ {
+		for r := -boardRadius; r <= boardRadius; r++ {
+			if abs(q)+abs(r)+abs(-q-r) <= 2*boardRadius {
+				c := HexCoord{q, r}
+				Coords[i] = c
+				IndexOf[c] = i
+				i++
 			}
 		}
 	}
-	coordsCache[radius] = result
-	return result
+}
+func initBoardTables() {
+	coords := AllCoords(boardRadius)
+	if len(coords) != BoardN {
+		// 保险：避免坐标枚举顺序变化导致 out-of-range
+		panic("AllCoords(boardRadius) size mismatch")
+	}
+	IndexOf = make(map[HexCoord]int, BoardN)
+	for i, c := range coords {
+		CoordOf[i] = c
+		IndexOf[c] = i
+	}
+	// 预计算邻居表
+	for i, c := range coords {
+
+		CoordOf[i] = c
+		IndexOf[c] = i
+		// 半径边界上的点就是外圈
+		if abs(c.Q) == boardRadius || abs(c.R) == boardRadius || abs(-c.Q-c.R) == boardRadius {
+			isOuterI[i] = true
+		}
+
+		for _, d := range Directions {
+			n := HexCoord{c.Q + d.Q, c.R + d.R}
+			if j, ok := IndexOf[n]; ok {
+				NeighI[i] = append(NeighI[i], j)
+			}
+		}
+		// 预计算跳跃：12 个方向（= 两步）
+		for _, d := range jumpDirs { // 你已有 jumpDirs
+			j := HexCoord{c.Q + d.Q, c.R + d.R}
+			if k, ok := IndexOf[j]; ok {
+				JumpI[i] = append(JumpI[i], k)
+			}
+		}
+	}
+}
+func AllCoords(radius int) []HexCoord {
+	if radius != boardRadius {
+		panic("unsupported radius")
+	}
+	return Coords[:]
 }
 
 func acquireBoard(radius int) *Board {
 	b := boardPool.Get().(*Board)
 	b.radius = radius
-	// 只分配一份 cells，如果已有就复用
-	if b.cells == nil {
-		b.cells = make(map[HexCoord]CellState, len(AllCoords(radius)))
-	} else {
-		for k := range b.cells {
-			delete(b.cells, k)
-		}
+	// 清空棋盘 & hash
+	for i := 0; i < BoardN; i++ {
+		b.Cells[i] = Empty
 	}
 	b.hash = 0
+	b.LastMove = Move{}
+	b.LastMover = Empty
+	b.LastInfect = 0
 	return b
 }
-
 func releaseBoard(b *Board) {
-	// 可选：清理 map 里的数据
-	for k := range b.cells {
-		delete(b.cells, k)
-	}
 	boardPool.Put(b)
 }
 
 func (b *Board) set(c HexCoord, s CellState) {
-	prev := b.cells[c]
-	if prev == s {
+	i, ok := IndexOf[c]
+	if !ok {
 		return
 	}
-	b.hash ^= zobristKey(c, prev) // 移除旧状态
-	b.cells[c] = s
-	b.hash ^= zobristKey(c, s) // 加入新状态
+	b.setI(i, s)
 }
 
 // NewBoard creates and initializes a new board with the given radius.
 func NewBoard(radius int) *Board {
-	b := &Board{
-		radius: radius,
-		cells:  make(map[HexCoord]CellState),
+	if radius != boardRadius {
+		panic("NewBoard: radius must be 3")
 	}
-	for q := -radius; q <= radius; q++ {
-		for r := -radius; r <= radius; r++ {
-			if abs(q)+abs(r)+abs(-q-r) <= 2*radius {
-				b.cells[HexCoord{q, r}] = Empty
-			}
-		}
+	b := &Board{radius: radius}
+	for i := 0; i < BoardN; i++ {
+		b.Cells[i] = Empty
+		// hash = 0（Empty 的 zob 不需要异或）
 	}
 	return b
 }
@@ -122,20 +161,16 @@ func (b *Board) InBounds(c HexCoord) bool {
 }
 
 // Get returns the cell state at coord c. If out of bounds, returns Blocked.
-func (b *Board) Get(c HexCoord) CellState {
-	if !b.InBounds(c) {
-		return Blocked
-	}
-	return b.cells[c]
-}
+func (b *Board) GetI(i int) CellState { return b.Cells[i] }
 
-// Set updates the cell state at coord c. Returns an error if c is out of bounds.
-func (b *Board) Set(c HexCoord, state CellState) error {
-	if !b.InBounds(c) {
-		return errors.New("coordinate out of bounds")
+func (b *Board) setI(i int, s CellState) {
+	prev := b.Cells[i]
+	if prev == s {
+		return
 	}
-	b.cells[c] = state
-	return nil
+	b.hash ^= zobKeyI(i, prev)
+	b.Cells[i] = s
+	b.hash ^= zobKeyI(i, s)
 }
 
 // Neighbors returns all in-bounds neighbor coordinates of c.
@@ -173,8 +208,8 @@ func abs(x int) int {
 
 func (b *Board) Clone() *Board {
 	nb := acquireBoard(b.radius)
-	for coord, state := range b.cells {
-		nb.cells[coord] = state
+	for coord, state := range b.Cells {
+		nb.Cells[coord] = state
 	}
 	nb.hash = b.hash
 	nb.LastMove = b.LastMove
@@ -185,33 +220,73 @@ func (b *Board) Clone() *Board {
 }
 
 func (b *Board) applyMove(m Move, player CellState) (infected int, undo func()) {
-	// 修改格子并同时异或/反异或 hash
-	changed := make([]struct {
-		c    HexCoord
+	opp := Opponent(player)
+
+	// 将坐标映射为下标（board 初始化时已填好 indexOf）
+	from, okFrom := IndexOf[m.From]
+	to, okTo := IndexOf[m.To]
+	if !okTo {
+		// 非法坐标；对于已合法化的走法生成器，这里理论上不会触发
+		return 0, func() {}
+	}
+
+	// 记录被修改过的格子（用于回溯）；容量估计：跳跃最多改 1(from) + 1(to) + 6(邻居) ≈ 8
+	type change struct {
+		i    int
 		prev CellState
-	}, 0, 8)
-	set := func(c HexCoord, s CellState) {
-		prev := b.cells[c]
+	}
+	changed := make([]change, 0, 8)
+
+	// 带记录的 set（维护 hash）
+	setI := func(i int, s CellState) {
+		prev := b.Cells[i]
 		if prev == s {
 			return
 		}
-		b.hash ^= zobristKey(c, prev) // remove old
-		b.cells[c] = s
-		b.hash ^= zobristKey(c, s) // add new
-		changed = append(changed, struct {
-			c    HexCoord
-			prev CellState
-		}{c, prev})
+		// 增量维护 zobrist
+		b.hash ^= zobKeyI(i, prev)
+		b.Cells[i] = s
+		b.hash ^= zobKeyI(i, s)
+
+		changed = append(changed, change{i: i, prev: prev})
 	}
 
-	// ……克隆 / 跳跃 / 感染逻辑，全用 set()
+	// —— 执行克隆 / 跳跃 —— //
+	if m.IsClone() {
+		// 克隆：仅在 to 放一个自己的子
+		setI(to, player)
+	} else {
+		// 跳跃：from 清空、to 放子
+		if okFrom {
+			setI(from, Empty)
+		}
+		setI(to, player)
+	}
 
-	return infected, func() { // 撤销函数供 alphaBeta 回溯
-		for i := len(changed) - 1; i >= 0; i-- {
-			c := changed[i]
-			set(c.c, c.prev)
+	// —— 邻居感染：把 to 的 6 邻居中属于对手的翻为我方 —— //
+	for _, j := range NeighI[to] {
+		if b.Cells[j] == opp {
+			setI(j, player)
+			infected++
 		}
 	}
+
+	// 撤销函数：按相反顺序恢复所有被改格
+	undo = func() {
+		for k := len(changed) - 1; k >= 0; k-- {
+			c := changed[k]
+			// 通过 setI 还原可以再次维护 hash；但 setI 会再次记录 change。
+			// 因此这里直接手动还原更省：反异或 + 赋值 + 再异或。
+			cur := b.Cells[c.i]
+			if cur != c.prev {
+				b.hash ^= zobKeyI(c.i, cur)
+				b.Cells[c.i] = c.prev
+				b.hash ^= zobKeyI(c.i, c.prev)
+			}
+		}
+	}
+
+	return infected, undo
 }
 
 // Hash 返回当前局面的 Zobrist 哈希（供置换表/外部工具读取）
@@ -222,25 +297,33 @@ func (b *Board) Hash() uint64 {
 // CountPieces 统计棋盘上 pl 方棋子数量
 func (b *Board) CountPieces(pl CellState) int {
 	n := 0
-	for _, c := range b.AllCoords() {
-		if b.Get(c) == pl {
+	for i := 0; i < BoardN; i++ { // boardN = 37
+		if b.Cells[i] == pl {
 			n++
 		}
 	}
 	return n
 }
 
-func (b *Board) ToFeature(side CellState) []float32 {
-	fe := make([]float32, len(b.AllCoords())) // 半径 3 = 37 格
-	for i, c := range b.AllCoords() {
-		switch b.Get(c) {
+func (b *Board) ToFeatureInto(side CellState, dst []float32) []float32 {
+	if cap(dst) < BoardN {
+		dst = make([]float32, BoardN)
+	} else {
+		dst = dst[:BoardN]
+	}
+	// 可选：不必先清零，因为下面会逐项覆盖
+	opp := Opponent(side)
+	for i := 0; i < BoardN; i++ {
+		switch b.Cells[i] {
 		case side:
-			fe[i] = 1
-		case Opponent(side):
-			fe[i] = -1
+			dst[i] = 1
+		case opp:
+			dst[i] = -1
+		default:
+			dst[i] = 0
 		}
 	}
-	return fe
+	return dst
 }
 
 func (b *Board) ApplyMove(m Move, player CellState) {

@@ -23,15 +23,19 @@ func DrawBoardAndPiecesWithHints(
 	jumpTargets := map[game.HexCoord]struct{}{}
 	if selected != nil {
 		from := *selected
-		for _, to := range board.AllCoords() {
-			if board.Get(to) != game.Empty {
-				continue // 目的地必须是空
+		fromIdx, ok := game.IndexOf[from] // 坐标转下标
+		if ok {
+			// 克隆目标：1 步邻居
+			for _, toIdx := range game.NeighI[fromIdx] {
+				if board.Cells[toIdx] == game.Empty {
+					cloneTargets[game.CoordOf[toIdx]] = struct{}{}
+				}
 			}
-			switch game.HexDist(from, to) {
-			case 1:
-				cloneTargets[to] = struct{}{}
-			case 2:
-				jumpTargets[to] = struct{}{}
+			// 跳跃目标：2 步邻居
+			for _, toIdx := range game.JumpI[fromIdx] {
+				if board.Cells[toIdx] == game.Empty {
+					jumpTargets[game.CoordOf[toIdx]] = struct{}{}
+				}
 			}
 		}
 	}
@@ -57,10 +61,11 @@ func DrawBoardAndPiecesWithHints(
 	originY := (float64(WindowHeight) - boardH*scale) / 2
 
 	// 5) 绘制棋盘底板
-	for _, c := range board.AllCoords() {
-		if board.Get(c) == game.Blocked {
+	for i := 0; i < game.BoardN; i++ {
+		if board.Cells[i] == game.Blocked {
 			continue // 跳过 Blocked 格子
 		}
+		c := game.CoordOf[i] // 下标转回坐标，用于计算绘制位置
 		drawHex(dst, tileImg, c, originX, originY, tileW, tileH, vs, scale)
 	}
 
@@ -77,9 +82,10 @@ func DrawBoardAndPiecesWithHints(
 	}
 
 	// 7) 最后绘制棋子
-	for _, c := range board.AllCoords() {
-		st := board.Get(c)
+	for i := 0; i < game.BoardN; i++ {
+		st := board.Cells[i]
 		if st == game.PlayerA || st == game.PlayerB {
+			c := game.CoordOf[i]
 			drawPiece(dst, pieceImgs[st], c, originX, originY, tileW, tileH, vs, scale)
 		}
 	}

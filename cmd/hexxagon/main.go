@@ -9,22 +9,32 @@ import (
 	"strconv"
 )
 
-// import _ "net/http/pprof"
+//import _ "net/http/pprof"
 
-// import "golang.org/x/sys/windows"
-// import "runtime"
+//func init() {
+//	if runtime.GOOS == "windows" {
+//		h := windows.CurrentProcess()
 //
-//	func init() {
-//		if runtime.GOOS == "windows" {
-//			h := windows.CurrentProcess()
-//
-//			// BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
-//			if err := windows.SetPriorityClass(h, windows.BELOW_NORMAL_PRIORITY_CLASS); err != nil {
-//				log.Printf("设置进程优先级失败: %v", err)
-//			} else {
-//				log.Println("已将进程优先级设置为 BELOW_NORMAL")
-//			}
+//		// BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+//		if err := windows.SetPriorityClass(h, windows.BELOW_NORMAL_PRIORITY_CLASS); err != nil {
+//			log.Printf("设置进程优先级失败: %v", err)
+//		} else {
+//			log.Println("已将进程优先级设置为 BELOW_NORMAL")
 //		}
+//	}
+//}
+
+//	func init() {
+//		go func() {
+//			addr := "127.0.0.1:6060" // 只监听本机，避免暴露外网
+//			log.Println("[pprof] listening on", addr, "/debug/pprof/")
+//			if err := http.ListenAndServe(addr, nil); err != nil {
+//				log.Println("pprof server error:", err)
+//			}
+//		}()
+//
+//		runtime.SetBlockProfileRate(1)     // 1：采样全部阻塞事件
+//		runtime.SetMutexProfileFraction(1) // 1：采样全部互斥锁事件
 //	}
 func main() {
 	const (

@@ -1,43 +1,64 @@
-// internal/game/tt.go
 package game
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// ------------------------------------------------------------
-//  Zobrist 随机键（预生成 + 零锁查询）
-// ------------------------------------------------------------
+// -------- 参数：按需调大 --------
+const ttBuckets = 1 << 21 // 桶数量（2M 桶）
+const ttWays = 4          // 组相联路数：2 或 4
+const ttMask = ttBuckets - 1
 
-// 如果你的棋盘最大半径固定，填在这里；否则可暴露为变量或在 initZobrist 里计算。
-const maxRadius = 3 // ★根据实际棋盘大小调整
+type ttFlag uint8
 
-var (
-	zobristCell     [][4]uint64      // 下标 → 4 个状态随机数
-	hexCoordToIndex map[HexCoord]int // 坐标 → 下标
-	onceZobristInit sync.Once
+const (
+	ttExact ttFlag = iota
+	ttLower
+	ttUpper
 )
 
-// side-to-move Zobrist keys: index 0 = PlayerA, index 1 = PlayerB
+type ttEntry struct {
+	// seqlock：偶数=稳定，奇数=写入中
+	version uint32  // 原子读写
+	score   int32   // 分值
+	depth   int32   // 搜索深度
+	flag    ttFlag  // 类型
+	bestIdx uint8   // 走法索引（可选）
+	key     uint64  // 原子发布（最后写）
+	_       [8]byte // 简单填充，减小伪共享（可按需调到 64B）
+}
+
 var zobristSide [2]uint64
+var (
+	ttTable         = make([][ttWays]ttEntry, ttBuckets)
+	ttProbeCount    uint64
+	ttHitCount      uint64
+	onceZobristInit sync.Once
+)
+var (
+	zobristCell     [][4]uint64
+	hexCoordToIndex map[HexCoord]int
+)
+
+var zobCell [BoardN][4]uint64           // [index][state]
+func zobKeyI(i int, s CellState) uint64 { return zobristCell[i][s] }
 
 // init 在程序启动时执行一次，生成所有随机键。
 func init() {
+	initBoardTables()
 	initZobrist()
+	initEncodeTables()
 }
-
-// initZobrist 预生成 maxRadius 棋盘内所有格子的 Zobrist 键。
 func initZobrist() {
 	onceZobristInit.Do(func() {
 		// 1) Seed the RNG for reproducible randomness
 		rand.Seed(time.Now().UnixNano())
 
 		// 2) Build per-cell Zobrist keys
-		coords := AllCoords(maxRadius)
+		coords := AllCoords(boardRadius)
 		zobristCell = make([][4]uint64, len(coords))
 		hexCoordToIndex = make(map[HexCoord]int, len(coords))
 		for i, c := range coords {
@@ -56,129 +77,121 @@ func initZobrist() {
 	})
 }
 
-// zobristKey 直接数组查表，0 锁、0 原子操作。
-func zobristKey(c HexCoord, s CellState) uint64 {
-	return zobristCell[hexCoordToIndex[c]][s]
+func ttKeyFor(b *Board, current CellState) uint64 {
+	return b.hash ^ zobristSide[sideIdx(current)]
 }
 
-// hashBoard 计算整盘哈希（全盘 XOR）。
-func hashBoard(b *Board) uint64 {
-	var h uint64
-	for coord, state := range b.cells {
-		if state != Empty {
-			h ^= zobristKey(coord, state)
+// 读：循环直到拿到稳定快照（version 偶数且前后一致）
+func probeTT(key uint64, needDepth int) (bool, int, ttFlag) {
+	atomic.AddUint64(&ttProbeCount, 1)
+	b := &ttTable[key&ttMask]
+
+	for w := 0; w < ttWays; w++ {
+		e := &b[w]
+		for {
+			v1 := atomic.LoadUint32(&e.version)
+			if v1&1 == 1 { // 正在写
+				// 退一步读其他路
+				break
+			}
+			k := atomic.LoadUint64(&e.key)
+			if k != key {
+				break
+			}
+			// 快照字段
+			score := atomic.LoadInt32(&e.score)
+			depth := atomic.LoadInt32(&e.depth)
+			flag := e.flag // 非原子也行
+
+			v2 := atomic.LoadUint32(&e.version)
+			if v1 == v2 && v2&1 == 0 { // 稳定
+				if int(depth) >= needDepth {
+					atomic.AddUint64(&ttHitCount, 1)
+					return true, int(score), flag
+				}
+				break
+			}
+			// 版本变化，重试这一路
 		}
-	}
-	return h
-}
-
-// ------------------------------------------------------------
-//  置换表（Transposition Table）
-// ------------------------------------------------------------
-
-const ttSize = 1 << 23 // 4 M entries ≈ 200 MB
-const ttMask = ttSize - 1
-
-type ttFlag uint8
-
-const (
-	ttExact ttFlag = iota
-	ttLower
-	ttUpper
-)
-
-type ttEntry struct {
-	key     uint64 // 哈希
-	score   int32  // αβ 分值
-	depth   int16  // 深度
-	flag    ttFlag // 界类型
-	bestIdx uint8  // 根节点最佳着（可选）
-}
-
-var (
-	ttProbeCount uint64 // 总 probe 次数
-	ttHitCount   uint64 // 命中次数
-)
-
-var (
-	ttTable = make([]ttEntry, ttSize) // 切片比 map 更快
-	ttMu    [256]sync.Mutex           // 分片锁（若需并发写更安全，可选）
-)
-
-func lockFor(hash uint64) *sync.Mutex { return &ttMu[hash&255] }
-
-// probeTT 只做累加，不打印
-func probeTT(hash uint64, depth int) (bool, int, ttFlag) {
-	ttProbeCount++
-	e := ttTable[hash&ttMask]
-	if e.key == hash && int(e.depth) >= depth {
-		ttHitCount++
-		return true, int(e.score), e.flag
 	}
 	return false, 0, 0
 }
 
-// storeTT - 写回置换表；以“深度更深者优先”策略覆盖。
-func storeTT(hash uint64, depth, score int, flag ttFlag) {
-	idx := hash & ttMask
-	if int(ttTable[idx].depth) <= depth {
-		ttTable[idx] = ttEntry{
-			key:   hash,
-			score: int32(score),
-			depth: int16(depth),
-			flag:  flag,
+// 写：优先覆盖同 key；否则覆盖“更浅深度”的槽；再不行覆盖 0 号
+func storeTT(key uint64, depth, score int, flag ttFlag) {
+	b := &ttTable[key&ttMask]
+
+	// 1) 找到要写的路
+	slot := 0
+	bestDepth := int(^uint(0) >> 1) // +Inf
+	for w := 0; w < ttWays; w++ {
+		e := &b[w]
+		if atomic.LoadUint64(&e.key) == key {
+			slot = w
+			break
+		}
+		d := int(atomic.LoadInt32(&e.depth))
+		if d < bestDepth {
+			bestDepth = d
+			slot = w
 		}
 	}
+
+	e := &b[slot]
+	// 2) seqlock: version++(odd) → 写字段 → 写 key → version++(even)
+	v := atomic.AddUint32(&e.version, 1) // 变奇数
+	_ = v
+
+	atomic.StoreInt32(&e.score, int32(score))
+	atomic.StoreInt32(&e.depth, int32(depth))
+	e.flag = flag // 非原子 OK
+	// bestIdx 留给 storeBestIdx 来写或置 0
+	atomic.StoreUint64(&e.key, key)
+
+	atomic.AddUint32(&e.version, 1) // 变回偶数，发布完成
 }
 
-func probeBestIdx(hash uint64) (bool, uint8) {
-	e := ttTable[hash&ttMask]
-	if e.key == hash {
-		return true, e.bestIdx
+func probeBestIdx(key uint64) (bool, uint8) {
+	b := &ttTable[key&ttMask]
+	for w := 0; w < ttWays; w++ {
+		e := &b[w]
+		for {
+			v1 := atomic.LoadUint32(&e.version)
+			if v1&1 == 1 {
+				break
+			}
+			if atomic.LoadUint64(&e.key) != key {
+				break
+			}
+			idx := e.bestIdx
+			v2 := atomic.LoadUint32(&e.version)
+			if v1 == v2 && v2&1 == 0 {
+				return true, idx
+			}
+		}
 	}
 	return false, 0
 }
 
-func storeBestIdx(hash uint64, idx uint8) {
-	e := &ttTable[hash&ttMask]
-	if e.key == hash { // 仅写同槽
-		e.bestIdx = idx
+func storeBestIdx(key uint64, idxBest uint8) {
+	b := &ttTable[key&ttMask]
+	for w := 0; w < ttWays; w++ {
+		e := &b[w]
+		if atomic.LoadUint64(&e.key) == key {
+			// 小字段非原子写即可；读侧有 seqlock 保护
+			e.bestIdx = idxBest
+			return
+		}
 	}
 }
 
-// 调用结束后，打印或获取命中率
-func GetTTStats() (probes, hits uint64, hitRate float64) {
+func GetTTStats() (probes, hits uint64, rate float64) {
 	probes = atomic.LoadUint64(&ttProbeCount)
 	hits = atomic.LoadUint64(&ttHitCount)
-	if probes == 0 {
-		hitRate = 0
-	} else {
-		hitRate = float64(hits) / float64(probes) * 100
+	if probes > 0 {
+		rate = float64(hits) / float64(probes) * 100
 	}
 	return
-}
-
-// 例如在搜索结束后调用：
-func PrintTTStats() {
-	probes, hits, rate := GetTTStats()
-	fmt.Printf("TT probes: %d, hits: %d, hit rate: %.2f%%\n", probes, hits, rate)
-}
-
-// RunSearch 是你最外层启动搜索的函数（改成你自己的名字）
-func RunSearch(b *Board, player CellState, depth int) int {
-	// 重置计数
-	ttProbeCount = 0
-	ttHitCount = 0
-
-	// 调用已有的 DeepSearch（你原来是：alphaBeta(b, b.hash, side, side,...)）
-	score := DeepSearch(b, b.hash, player, depth)
-
-	// 只在这里打印一次
-	probes, hits, rate := GetTTStats()
-	fmt.Printf("TT probes: %d, hits: %d, hit rate: %.2f%%\n",
-		probes, hits, rate)
-
-	return score
 }
 
 func sideIdx(p CellState) int {
@@ -186,4 +199,8 @@ func sideIdx(p CellState) int {
 		return 1
 	}
 	return 0
+}
+
+func zobristKey(c HexCoord, s CellState) uint64 {
+	return zobristCell[hexCoordToIndex[c]][s]
 }
