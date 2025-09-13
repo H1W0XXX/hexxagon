@@ -19,6 +19,7 @@ func init() {
 
 // const useLearned = true
 const useLearned = false
+const useLearned2 = true
 const jumpMovePenalty = 25
 
 // ------------------------------------------------------------
@@ -122,13 +123,13 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 		undo := mMakeMoveWithUndo(b, m, player)
 		s := func() int {
 			if useLearned {
-				return EvaluateNN(b, player)
+				return HybridEval(b, player)
 			}
 			return evaluateStatic(b, player)
 		}()
 		// 轻量启发：感染数加权，能明显稳定排序（尤其早中期）
 		inf := previewInfectedCount(b, m, player)
-		s += 3 * inf
+		s += 2 * inf
 
 		b.UnmakeMove(undo)
 
@@ -272,6 +273,7 @@ func alphaBeta(
 	alpha, beta int,
 	allowJump bool,
 ) int {
+	incNodes()
 	// 1) 走法生成（含 UI 禁跳）
 	moves := GenerateMoves(b, current)
 	moves = filterJumpsByFlag(b, current, moves, allowJump)
@@ -280,7 +282,7 @@ func alphaBeta(
 		// original 视角的评估（和你原来一致）
 		var valOrig int
 		if useLearned {
-			valOrig = EvaluateNN(b, original)
+			valOrig = HybridEval(b, original)
 		} else {
 			valOrig = evaluateStatic(b, original)
 		}

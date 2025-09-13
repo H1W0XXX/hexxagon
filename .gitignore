@@ -22,7 +22,7 @@ Thumbs.db
 selfplayData/
 *.csv
 *.json
-
+*.gz
 selfplay
 *.txt
 onnxruntime.dll
@@ -30,6 +30,7 @@ libonnxruntime.dylib
 hex_cnn.onnx
 hex_cnn.pt
 train1.py
+libonnxruntime.so
 
 cmd/selfplay
 hexxagon-darwin-arm64

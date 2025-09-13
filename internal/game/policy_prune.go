@@ -12,9 +12,9 @@ var (
 	policyPruneEnabled = true
 
 	// 保留比例 + 下限/上限：keep = clamp(minKeep, int(len(moves)*keepRatio), maxKeep)
-	policyKeepRatio = 0.8
-	policyMinKeep   = 16
-	policyMaxKeep   = 48
+	policyKeepRatio = 0.6
+	policyMinKeep   = 12
+	policyMaxKeep   = 32
 
 	// 如果想把保留下来的走法顺序也按 policy 排序供后续 α–β 使用
 	policyAlsoOrder = true
