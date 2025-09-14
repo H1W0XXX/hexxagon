@@ -4,6 +4,7 @@ package game
 import (
 	_ "embed"
 	"log"
+	"runtime"
 
 	//"errors"
 	"fmt"
@@ -95,13 +96,40 @@ func ensureONNX() error {
 		}
 
 		// 5) 用内存模型创建 AdvancedSession
+		so, err := ort.NewSessionOptions()
+		if err != nil {
+			ortErr = fmt.Errorf("NewSessionOptions: %w", err)
+			return
+		}
+
+		// 可选：图优化更激进（不同版本接口名可能略有不同，可省略）
+		// _ = so.SetGraphOptimizationLevel(ort.GraphOptimizationLevelAll)
+
+		if runtime.GOOS == "windows" {
+			if cudaOpts, e := ort.NewCUDAProviderOptions(); e == nil && cudaOpts != nil {
+				// 可选：设置 device_id 等；值用字符串
+				// 参考官方配置键：https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#configuration-options
+				_ = cudaOpts.Update(map[string]string{
+					"device_id": "0",
+					// "arena_extend_strategy": "kNextPowerOfTwo",
+					// "gpu_mem_limit": "0",
+				})
+				if err := so.AppendExecutionProviderCUDA(cudaOpts); err != nil {
+					log.Printf("[ensureONNX] CUDA EP init failed, fallback to CPU: %v", err)
+				}
+				_ = cudaOpts.Destroy()
+			} else {
+				log.Printf("[ensureONNX] NewCUDAProviderOptions failed, fallback to CPU: %v", e)
+			}
+		}
+
 		ortSess, e = ort.NewAdvancedSessionWithONNXData(
 			onnxBytes,
 			[]string{onnxInputName},
 			[]string{onnxPolicyName, onnxValueName},
 			[]ort.Value{inTensor},
 			[]ort.Value{outP, outV},
-			nil,
+			so,
 		)
 		if e != nil || ortSess == nil {
 			ortErr = fmt.Errorf("NewAdvancedSessionWithONNXData: %v", e)

@@ -13,11 +13,8 @@ var (
 
 	// 保留比例 + 下限/上限：keep = clamp(minKeep, int(len(moves)*keepRatio), maxKeep)
 	policyKeepRatio = 0.6
-	policyMinKeep   = 12
-	policyMaxKeep   = 32
-
-	// 如果想把保留下来的走法顺序也按 policy 排序供后续 α–β 使用
-	policyAlsoOrder = true
+	policyMinKeep   = 6
+	policyMaxKeep   = 8
 )
 
 // 覆盖率阈值（基础值）；当熵高时会提高该阈值
@@ -205,26 +202,28 @@ func policyPruneRoot(b *Board, player CellState, moves []Move) []Move {
 		kept = kept[:want]
 	}
 
-	// 输出
-	out := make([]Move, len(kept))
-	for i := range kept {
-		out[i] = kept[i].mv
+	// 输出：先修剪，再排序
+	out := make([]rec, 0, len(kept))
+	for _, r := range kept {
+		out = append(out, r)
 	}
 
-	// 是否也用 policy 顺序喂给 α–β
-	if policyAlsoOrder {
-		return out
-	}
-	// 只修剪，不改原始顺序
-	keepMap := make(map[Move]struct{}, len(out))
-	for _, m := range out {
-		keepMap[m] = struct{}{}
-	}
-	final := out[:0]
-	for _, m := range moves {
-		if _, ok := keepMap[m]; ok {
-			final = append(final, m)
+	// 按 policy 概率从大到小排，概率相同则按启发式次序
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].p != out[j].p {
+			return out[i].p > out[j].p
 		}
+		// tie-break：克隆优先，其次感染数高的优先
+		if out[i].mv.IsClone() != out[j].mv.IsClone() {
+			return out[i].mv.IsClone()
+		}
+		return out[i].inf > out[j].inf
+	})
+
+	// 提取出 Move 切片
+	final := make([]Move, len(out))
+	for i := range out {
+		final[i] = out[i].mv
 	}
 	return final
 }

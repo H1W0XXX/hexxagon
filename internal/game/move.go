@@ -10,12 +10,12 @@ type Move struct {
 
 // cloneDirs 定义了 6 个相邻偏移（Distance == 1 的方向）
 var cloneDirs = []HexCoord{
-	{+1, 0},  // 东
+	{+1, 0},  // 东南
 	{+1, -1}, // 东北
-	{0, -1},  // 西北
-	{-1, 0},  // 西
+	{0, -1},  // 北
+	{-1, 0},  // 东北
 	{-1, +1}, // 西南
-	{0, +1},  // 东南
+	{0, +1},  // 南
 }
 
 // jumpDirs 定义了 12 个跳跃偏移（Distance == 2 的方向）
@@ -112,32 +112,6 @@ func GenerateMoves(b *Board, player CellState) []Move {
 	}
 	return moves
 }
-
-// GenerateMoves 枚举玩家 player 在棋盘 b 上所有合法走法
-//func GenerateMovesOld(b *Board, player CellState) []Move {
-//	var moves []Move
-//	// 遍历所有格子
-//	for _, c := range b.AllCoords() {
-//		if b.Get(c) != player {
-//			continue
-//		}
-//		// 1) 复制走法：6 个方向
-//		for _, d := range cloneDirs {
-//			to := HexCoord{c.Q + d.Q, c.R + d.R}
-//			if b.Get(to) == Empty {
-//				moves = append(moves, Move{From: c, To: to})
-//			}
-//		}
-//		// 2) 跳跃走法：12 个方向
-//		for _, d := range jumpDirs {
-//			to := HexCoord{c.Q + d.Q, c.R + d.R}
-//			if b.Get(to) == Empty {
-//				moves = append(moves, Move{From: c, To: to})
-//			}
-//		}
-//	}
-//	return moves
-//}
 
 // 1) 把 Apply 改成返回被感染的坐标切片
 // Move.Apply —— 在棋盘上执行一步棋：克隆或跳跃 + 邻居感染

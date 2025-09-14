@@ -21,6 +21,7 @@ type FrameAnim struct {
 	From       game.HexCoord // 新增：动画发起位置
 	To         game.HexCoord // 目标格
 	MidX, MidY float64       // new: pixel midpoint in offscreen coords
+
 }
 
 func (a *FrameAnim) Current() *ebiten.Image {
@@ -78,28 +79,29 @@ func (gs *GameScreen) addMoveAnim(move game.Move, player game.CellState) {
 
 	base := ""
 	switch {
-	//case move.IsJump() && player == game.PlayerA:
-	//	base = "redJump/" + dirKey
-	//case move.IsJump() && player == game.PlayerB:
-	//	base = "whiteJump/" + dirKey
+	case move.IsJump() && player == game.PlayerA:
+		base = "redJump/" + dirKey
+	case move.IsJump() && player == game.PlayerB:
+		base = "whiteJump/" + dirKey
 	case move.IsClone() && player == game.PlayerA:
 		base = "redClone/" + dirKey
 	case move.IsClone() && player == game.PlayerB:
 		base = "whiteClone/" + dirKey
 	}
-	//fmt.Println(base)
+
 	frames := assets.AnimFrames[base]
 	if len(frames) == 0 {
-		//fmt.Printf("!跳跃或者复制动画资源缺失: %s\n", base)
+		fmt.Printf("!跳跃/复制动画资源缺失: %s\n", base)
 		return
 	}
+	//fmt.Println("ADD", base, "off=", AnimOffset[base])
 	gs.anims = append(gs.anims, &FrameAnim{
 		Frames: frames,
 		FPS:    30,
 		Start:  time.Now(),
 		Coord:  move.From,
 		Angle:  0,
-		Key:    base,
+		Key:    base, // ← Draw() 里会用这个 key 去取 AnimOffset[base]
 	})
 }
 
@@ -154,19 +156,72 @@ func (gs *GameScreen) addInfectAnim(
 // 6 个方向关键词（根据 dq,dr 返回）
 func directionKey(from, to game.HexCoord) string {
 	dq, dr := to.Q-from.Q, to.R-from.R
-	switch [2]int{dq, dr} {
-	case [2]int{+1, 0}:
-		return "lowerright"
-	case [2]int{+1, -1}:
-		return "upperright"
-	case [2]int{0, -1}:
-		return "up"
-	case [2]int{-1, 0}:
-		return "upperleft"
-	case [2]int{-1, +1}:
-		return "lowerleft"
-	case [2]int{0, +1}:
+
+	abs := func(x int) int {
+		if x < 0 {
+			return -x
+		}
+		return x
+	}
+	dist := func(dq, dr int) int {
+		aq, ar, as := abs(dq), abs(dr), abs(dq+dr)
+		if aq < ar {
+			aq = ar
+		}
+		if aq < as {
+			aq = as
+		}
+		return aq
+	}
+
+	switch dist(dq, dr) {
+	case 1: // —— Clone 六方向 —— //
+		switch [2]int{dq, dr} {
+		case [2]int{+1, 0}:
+			return "lowerright"
+		case [2]int{+1, -1}:
+			return "upperright"
+		case [2]int{0, -1}:
+			return "up"
+		case [2]int{-1, 0}:
+			return "upperleft"
+		case [2]int{-1, +1}:
+			return "lowerleft"
+		case [2]int{0, +1}:
+			return "down"
+		}
+		return "down"
+
+	case 2: // —— Jump 十二方向 —— //
+		switch [2]int{dq, dr} {
+		case [2]int{0, -2}:
+			return "12" //
+		case [2]int{1, -2}:
+			return "01" //
+		case [2]int{2, -2}:
+			return "02" //
+		case [2]int{2, -1}:
+			return "03" //
+		case [2]int{2, 0}:
+			return "04" //
+		case [2]int{1, 1}:
+			return "05"
+		case [2]int{0, 2}:
+			return "06" //
+		case [2]int{-1, 2}:
+			return "07" //
+		case [2]int{-2, 2}:
+			return "08" //
+		case [2]int{-2, 1}:
+			return "09" //
+		case [2]int{-2, 0}:
+			return "10" //
+		case [2]int{-1, -1}:
+			return "11" //
+		}
+		return "01"
+
+	default:
 		return "down"
 	}
-	return "down"
 }

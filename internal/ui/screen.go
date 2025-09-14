@@ -28,44 +28,54 @@ var fontFace = basicfont.Face7x13
 
 // AnimOffset 给每个动画 key 一个手动微调 (X, Y)，单位：像素
 var AnimOffset = map[string]struct{ X, Y float64 }{
-	// ★ 你手动调整过的
-	"redClone/down": {X: -10, Y: -45},
-
 	// ↓ redClone
-	"redClone/lowerleft":  {X: -65, Y: -45},
-	"redClone/lowerright": {X: 0, Y: -45},
-	"redClone/up":         {X: -10, Y: -55},
-	"redClone/upperleft":  {X: -50, Y: -40},
-	"redClone/upperright": {X: 0, Y: -45},
+	"redClone/down":       {X: -130, Y: -450}, //
+	"redClone/lowerleft":  {X: -560, Y: -490}, //
+	"redClone/lowerright": {X: -150, Y: -500}, //
+	"redClone/up":         {X: -140, Y: -550}, //
+	"redClone/upperleft":  {X: -600, Y: -420}, //
+	"redClone/upperright": {X: -200, Y: -450}, //
 
-	// ↓ redJump动画错误
-	"redJump/down":       {X: -11, Y: -45},
-	"redJump/lowerleft":  {X: 0, Y: 0},   // 动画错误
-	"redJump/lowerright": {X: 0, Y: 0},   // 动画错误
-	"redJump/up":         {X: 0, Y: -45}, // 动画错误
-	"redJump/upperleft":  {X: 0, Y: 0},
-	"redJump/upperright": {X: 0, Y: 0},
+	// ↓ redJump动画
+	"redJump/01": {X: 0, Y: -350},    //
+	"redJump/02": {X: -50, Y: -400},  //
+	"redJump/03": {X: 50, Y: -400},   //
+	"redJump/04": {X: 0, Y: -300},    //
+	"redJump/05": {X: -100, Y: -500}, //
+	"redJump/06": {X: -150, Y: -500}, //
+	"redJump/07": {X: -650, Y: -600}, //
+	"redJump/08": {X: -600, Y: -500}, //
+	"redJump/09": {X: -700, Y: -600}, //
+	"redJump/10": {X: -650, Y: -600}, //
+	"redJump/11": {X: -650, Y: -600}, //
+	"redJump/12": {X: -600, Y: -600}, //
 
 	// ↓ whiteClone
-	"whiteClone/down":       {X: -60, Y: -60},
-	"whiteClone/lowerleft":  {X: -60, Y: -65},
-	"whiteClone/lowerright": {X: -50, Y: -60},
-	"whiteClone/up":         {X: -60, Y: -60},
-	"whiteClone/upperleft":  {X: -60, Y: -60},
-	"whiteClone/upperright": {X: -60, Y: -60},
+	"whiteClone/down":       {X: -600, Y: -700}, //
+	"whiteClone/lowerleft":  {X: -600, Y: -670}, //
+	"whiteClone/lowerright": {X: -500, Y: -650}, //
+	"whiteClone/up":         {X: -600, Y: -350}, //
+	"whiteClone/upperleft":  {X: -600, Y: -600}, //
+	"whiteClone/upperright": {X: -600, Y: -600}, //
 
-	// ↓ whiteJump动画错误
-	"whiteJump/down":       {X: 0, Y: 0},
-	"whiteJump/lowerleft":  {X: 0, Y: 0},
-	"whiteJump/lowerright": {X: 0, Y: 0},
-	"whiteJump/up":         {X: 0, Y: 0},
-	"whiteJump/upperleft":  {X: 0, Y: 0},
-	"whiteJump/upperright": {X: 0, Y: 0},
+	// ↓ whiteJump动画
+	"whiteJump/01": {X: -500, Y: -500}, //？
+	"whiteJump/02": {X: -500, Y: -600}, //？
+	"whiteJump/03": {X: -400, Y: -600}, //
+	"whiteJump/04": {X: -500, Y: -500}, //
+	"whiteJump/05": {X: -500, Y: -500}, //
+	"whiteJump/06": {X: -600, Y: -400},
+	"whiteJump/07": {X: -500, Y: -500}, //？
+	"whiteJump/08": {X: -850, Y: -400},
+	"whiteJump/09": {X: -650, Y: -550}, //
+	"whiteJump/10": {X: -650, Y: -550},
+	"whiteJump/11": {X: -600, Y: -500}, //
+	"whiteJump/12": {X: -600, Y: -400}, //？
 
 	// ↓ 感染动画（不分方向）
-	"redEatWhite":             {X: 0, Y: 0},
-	"whiteEatRed":             {X: 0, Y: 0},
-	"afterRedInfectedByWhite": {X: 0, Y: 0},
+	"redEatWhite":             {X: 0, Y: 0}, //
+	"whiteEatRed":             {X: 0, Y: 0}, //
+	"afterRedInfectedByWhite": {X: 0, Y: 0}, //
 }
 var soundDurations = map[string]time.Duration{
 	"white_split":              470 * time.Millisecond,
