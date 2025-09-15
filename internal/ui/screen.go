@@ -149,6 +149,10 @@ type GameScreen struct {
 
 	boardBaked   *ebiten.Image // 预渲染好的整盘底图(含渐变)
 	boardBakedOK bool          // 标志是否已烘焙
+
+	aiResultCh chan game.Move // 后台AI结果传回（容量1）
+	aiCancelCh chan struct{}  // 取消信号（close 即取消）
+	aiRunning  bool           // 是否有AI在后台跑
 }
 type tempGhost struct {
 	coord  game.HexCoord
@@ -210,6 +214,9 @@ func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen,
 
 	// 画板缓冲
 	gs.offscreen = ebiten.NewImage(WindowWidth, WindowHeight)
+
+	gs.aiResultCh = make(chan game.Move, 1)
+	gs.aiCancelCh = make(chan struct{})
 	return gs, nil
 }
 
@@ -347,6 +354,14 @@ func (gs *GameScreen) Update() error {
 	// 1) 音频
 	gs.audioManager.Update()
 	if gs.state.GameOver {
+		if gs.aiRunning {
+			close(gs.aiCancelCh) // 通知后台线程退出（如果你能改搜索层，那里要检查ctx/cancel）
+			gs.aiRunning = false
+		}
+		gs.showThinking = false
+		gs.aiQueuedMove = nil
+		gs.aiThinkingUntil = time.Time{}
+		gs.aiDelayUntil = time.Time{}
 		return nil
 	}
 
@@ -398,42 +413,68 @@ func (gs *GameScreen) Update() error {
 	}
 
 	// 5) AI 回合（White）
+	// 5) AI 回合（White）
 	if gs.aiEnabled && gs.state.CurrentPlayer == game.PlayerB {
-		// 任何“动画/提交/AI延迟窗口”期间，都不允许应用AI
+
+		// 动画没完 / 等提交 / 延迟窗口：先别启动AI，UI照常跑
 		if gs.isAnimating || gs.pendingCommit != nil || time.Now().Before(gs.aiDelayUntil) {
 			return nil
 		}
 
-		// 若还没有缓存的 AI 结果：开始“思考阶段”（先显示≥1s思考图标，再应用）
-		if gs.aiQueuedMove == nil {
-			gs.aiThinkingStart = time.Now()
-			gs.aiThinkingUntil = gs.aiThinkingStart.Add(1 * time.Second) // 至少 1s
-			gs.showThinking = true
+		now := time.Now()
 
-			if mv, _, ok := game.IterativeDeepening(gs.state.Board, game.PlayerB, depth, gs.aiJumpUnlocked); ok {
-				gs.aiQueuedMove = &mv
-			} else {
-				// 没算出结果就先退出（图标会继续显示一小会儿，下一帧再试也行）
-				return nil
-			}
-			return nil
-		}
-
-		// 已有 AI 结果：等到“思考图标”满 1s 后，再真正应用
-		if time.Now().After(gs.aiThinkingUntil) {
+		// —— 优先：如果已有结果，且思考图标展示达到下限 —— //
+		if gs.aiQueuedMove != nil && now.After(gs.aiThinkingUntil) {
 			mv := *gs.aiQueuedMove
 			gs.aiQueuedMove = nil
 			gs.showThinking = false
 
 			if total, err := gs.performMove(mv, game.PlayerB); err == nil {
-				// 下一次至少推迟到动画结束
-				gs.aiDelayUntil = time.Now().Add(total)
+				gs.aiDelayUntil = time.Now().Add(total) // 让下一次AI启动等动画播完
 			}
 			gs.selected = nil
 			return nil
 		}
 
-		// 还没满 1s，就继续显示图标，先不应用
+		// —— 若没有在跑且也没有排队结果：启动一次后台搜索 —— //
+		if !gs.aiRunning && gs.aiQueuedMove == nil {
+			gs.aiThinkingStart = now
+			gs.aiThinkingUntil = gs.aiThinkingStart.Add(1 * time.Second) // 至少展示1秒思考中
+			gs.showThinking = true
+			gs.aiRunning = true
+
+			// 每次新任务换一个 cancel 通道
+			gs.aiCancelCh = make(chan struct{})
+
+			boardCopy := gs.state.Board.Clone()
+			allowJump := gs.aiJumpUnlocked
+			depthLim := depth
+
+			go func(b *game.Board, d int, allow bool, out chan<- game.Move, cancel <-chan struct{}) {
+				mv, _, ok := game.IterativeDeepening(b, game.PlayerB, d, allow)
+				select {
+				case <-cancel:
+					return // 已取消
+				default:
+				}
+				if ok {
+					select { // 非阻塞投递
+					case out <- mv:
+					default:
+					}
+				}
+			}(boardCopy, depthLim, allowJump, gs.aiResultCh, gs.aiCancelCh)
+		}
+
+		// —— 非阻塞尝试收取结果（仅缓存，不立刻落子）—— //
+		select {
+		case mv := <-gs.aiResultCh:
+			gs.aiQueuedMove = &mv
+			gs.aiRunning = false
+		default:
+			// 还在计算/未有结果：仅维持UI刷新（思考图标/动画）
+		}
+
 		return nil
 	}
 

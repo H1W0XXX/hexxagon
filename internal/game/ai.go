@@ -13,7 +13,7 @@ import (
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	runtime.GOMAXPROCS(runtime.NumCPU() - 1) // 吃满物理/逻辑核心
+	runtime.GOMAXPROCS(runtime.NumCPU() - 2) // 吃满物理/逻辑核心
 
 }
 
