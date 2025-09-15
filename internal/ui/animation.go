@@ -255,3 +255,29 @@ func animDuration(base string, fps float64) time.Duration {
 	sec := float64(len(frames)) / fps
 	return time.Duration(sec * float64(time.Second))
 }
+
+// 新增：为被感染的格子添加“变色”动画（居中播放，无旋转）
+func (gs *GameScreen) addBecomeAnim(
+	to game.HexCoord,
+	player game.CellState,
+	delay time.Duration,
+) {
+	base := "whiteBecomeRed" // 红方吃对白方，白子变红
+	if player == game.PlayerB {
+		// 白方吃掉红方，红子变白
+		base = "redBecomeWhite"
+	}
+	frames := assets.AnimFrames[base]
+	if len(frames) == 0 {
+		fmt.Printf("!感染渐变资源缺失: %s\n", base)
+		return
+	}
+	gs.anims = append(gs.anims, &FrameAnim{
+		Frames: frames,
+		FPS:    30,
+		Start:  time.Now().Add(delay),
+		Coord:  to,   // 在被感染格居中播放
+		Angle:  0,    // 不需要旋转
+		Key:    base, // 用于 Draw 分支：中心贴合
+	})
+}
