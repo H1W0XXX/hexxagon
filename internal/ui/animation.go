@@ -225,3 +225,33 @@ func directionKey(from, to game.HexCoord) string {
 		return "down"
 	}
 }
+
+// 计算指定 move 在当前 board 上会感染到的邻居格（不改 board）
+func computeInfections(b *game.Board, mv game.Move, player game.CellState) []game.HexCoord {
+	op := game.PlayerA
+	if player == game.PlayerA {
+		op = game.PlayerB
+	}
+	toIdx, ok := game.IndexOf[mv.To]
+	if !ok {
+		return nil
+	}
+
+	var out []game.HexCoord
+	for _, n := range game.NeighI[toIdx] {
+		if b.Cells[n] == op {
+			out = append(out, game.CoordOf[n])
+		}
+	}
+	return out
+}
+
+// 查询某个动画资源的播放时长（按 30fps 或帧率参数）
+func animDuration(base string, fps float64) time.Duration {
+	frames := assets.AnimFrames[base]
+	if fps <= 0 {
+		fps = 30
+	}
+	sec := float64(len(frames)) / fps
+	return time.Duration(sec * float64(time.Second))
+}

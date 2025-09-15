@@ -129,8 +129,33 @@ type GameScreen struct {
 	showScores     bool
 	aiJumpUnlocked bool // 一旦为 true，后续所有搜索都允许跳越
 	fontFace       font.Face
-}
 
+	pendingCommit *struct {
+		move   game.Move
+		player game.CellState
+		when   time.Time
+		// 仅用于 Sparkle/音效：这回合新增
+		newborns []game.HexCoord // move.To + infections
+	}
+	// 思考图标与AI缓存
+	aiThinkingStart time.Time
+	aiThinkingUntil time.Time
+	aiQueuedMove    *game.Move // 已算出但尚未应用
+	showThinking    bool
+	aiThinkingImg   *ebiten.Image // 思考中图标
+
+	tempGhosts []tempGhost                // 幽灵棋子（视觉层）
+	tempHide   map[game.HexCoord]struct{} // 临时隐藏：坐标→到期时间（跳跃旧位）
+
+	boardBaked   *ebiten.Image // 预渲染好的整盘底图(含渐变)
+	boardBakedOK bool          // 标志是否已烘焙
+}
+type tempGhost struct {
+	coord  game.HexCoord
+	player game.CellState
+	showAt time.Time // 动画结束出现
+	hideAt time.Time // 提交时隐藏（提交后棋盘有真子）
+}
 type ReplayStep struct {
 	Move game.Move `json:"move"`
 }
@@ -151,7 +176,7 @@ func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen,
 		ui:          UIState{}, // 初始化 UIState
 		fontFace:    basicfont.Face7x13,
 	}
-
+	gs.tempHide = make(map[game.HexCoord]struct{})
 	// 加载贴图
 	if gs.tileImage, err = assets.LoadImage("hex_space"); err != nil {
 		return nil, err
@@ -169,6 +194,10 @@ func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen,
 		return nil, err
 	}
 
+	if gs.aiThinkingImg, err = assets.LoadImage("aiThinking"); err != nil {
+		return nil, fmt.Errorf("加载 aiThinking.png 失败: %w", err)
+	}
+
 	// 如果启动时就要显示评分，先计算一次
 	if gs.showScores {
 		gs.refreshMoveScores()
@@ -184,111 +213,138 @@ func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen,
 	return gs, nil
 }
 
+var frameEps = time.Second / 60
+
 // performMove 执行一次完整落子，返回本次行动需要的总耗时（用于 aiDelayUntil）
 func (gs *GameScreen) performMove(move game.Move, player game.CellState) (time.Duration, error) {
-	gs.isAnimating = true // 开始动画时设置为 true
+	baseNow := time.Now() // 用一个固定基准时间，避免多次 time.Now() 造成边界帧误差
+	gs.isAnimating = true
 
-	if move.IsJump() {
-		// Jump 类型：立即更新棋盘状态
-		infectedCoords, undo, err := gs.state.MakeMove(move)
-		_ = undo
-		if err != nil {
-			gs.isAnimating = false
-			return 0, err
-		}
-		if len(infectedCoords) > 0 {
-			//fmt.Println("感染一个棋子，开始跳越")
-			gs.aiJumpUnlocked = true
-		}
-		// 播放移动动画
-		gs.addMoveAnim(move, player)
+	infected := computeInfections(gs.state.Board, move, player)
+	gs.addMoveAnim(move, player)
 
-		// 计算移动动画时长
-		dirKey := directionKey(move.From, move.To)
-		var moveBase string
-		if player == game.PlayerA {
-			moveBase = "redJump/" + dirKey
-		} else {
-			moveBase = "whiteJump/" + dirKey
-		}
-		frames := assets.AnimFrames[moveBase]
-		const fps = 30
-		moveDur := time.Duration(float64(len(frames)) / fps * float64(time.Second))
+	dirKey := directionKey(move.From, move.To)
+	var moveBase string
+	switch {
+	case move.IsJump() && player == game.PlayerA:
+		moveBase = "redJump/" + dirKey
+	case move.IsJump() && player == game.PlayerB:
+		moveBase = "whiteJump/" + dirKey
+	case move.IsClone() && player == game.PlayerA:
+		moveBase = "redClone/" + dirKey
+	default:
+		moveBase = "whiteClone/" + dirKey
+	}
+	moveDur := animDuration(moveBase, 30)
 
-		// 添加感染动画（延迟到移动动画结束后）
-		for _, inf := range infectedCoords {
+	// ---- 只在确实有感染时，添加感染动画并计算感染时长 ----
+	var infectDur time.Duration
+	if len(infected) > 0 {
+		infectBase := "redEatWhite"
+		if player == game.PlayerB {
+			infectBase = "whiteEatRed"
+		}
+		infectDur = animDuration(infectBase, 30)
+		for _, inf := range infected {
+			// 感染动画从“移动动画结束”开始
 			gs.addInfectAnim(move.To, inf, player, moveDur)
 		}
+	} else {
+		infectDur = 0
+	}
 
-		// 组装音效队列
+	// ---- 音效在移动动画结束点触发序列（保留你的原逻辑）----
+	time.AfterFunc(moveDur, func() {
 		var seq []string
-		if player == game.PlayerA {
-			seq = append(seq, "red_split") // 红方 jump 暂时复用 split 音效
+		if move.IsJump() {
+			if player == game.PlayerA {
+				seq = append(seq, "red_split")
+			} else {
+				seq = append(seq, "white_jump")
+			}
 		} else {
-			seq = append(seq, "white_jump")
+			if player == game.PlayerA {
+				seq = append(seq, "red_split")
+			} else {
+				seq = append(seq, "white_split")
+			}
 		}
-		if len(infectedCoords) > 0 {
+		if len(infected) > 0 {
 			if player == game.PlayerA {
 				seq = append(seq, "red_capture_white_before", "red_capture_white_after")
 			} else {
 				seq = append(seq, "white_capture_red_before", "white_capture_red_after")
 			}
+			seq = append(seq, "all_capture_after")
 		}
-		seq = append(seq, "all_capture_after")
+		gs.audioManager.PlaySequential(seq...)
+	})
 
-		// 延迟播放音效
-		time.AfterFunc(moveDur, func() { gs.audioManager.PlaySequential(seq...) })
+	// ---- 统一用基准时间计算关键时间点 ----
+	commitAt := baseNow.Add(moveDur + infectDur)
 
-		// 返回移动动画时长
-		return moveDur, nil
-	} else { // —— Clone 类型 —— //
-		// 1) 先播移动动画
-		gs.addMoveAnim(move, player)
-
-		// 2) 计算动画时长
-		dirKey := directionKey(move.From, move.To)
-		var moveBase string
-		if player == game.PlayerA {
-			moveBase = "redClone/" + dirKey
-		} else {
-			moveBase = "whiteClone/" + dirKey
-		}
-		frames := assets.AnimFrames[moveBase]
-		const fps = 30
-		moveDur := time.Duration(float64(len(frames)) / fps * float64(time.Second))
-
-		// 3) 把“真正落子”推迟到主线程 Update() 中执行
-		gs.pendingClone = &pendingClone{
-			move:     move,
-			player:   player,
-			execTime: time.Now().Add(moveDur),
-		}
-
-		// 4) 返回动画持续时间（供 AI 延迟）
-		return moveDur, nil
+	// 幽灵棋子：在移动动画结束“略早半帧”出现，直到提交时隐藏
+	showAt := baseNow.Add(moveDur - frameEps)
+	if showAt.Before(baseNow) {
+		showAt = baseNow
 	}
+
+	gs.tempGhosts = append(gs.tempGhosts, tempGhost{
+		coord:  move.To,
+		player: player,
+		showAt: showAt,
+		hideAt: commitAt,
+	})
+
+	if move.IsJump() {
+		// 跳跃：源格立即隐藏，直到提交后恢复由真实棋盘决定
+		gs.tempHide[move.From] = struct{}{}
+	}
+
+	// 记录本回合新增（落点 + 被感染），用于提交后 sparkle（你现在先不画也行）
+	newborns := make([]game.HexCoord, 0, 1+len(infected))
+	newborns = append(newborns, move.To)
+	newborns = append(newborns, infected...)
+
+	// 安排真正提交（动画全部结束后一次性改盘面）
+	gs.pendingCommit = &struct {
+		move     game.Move
+		player   game.CellState
+		when     time.Time
+		newborns []game.HexCoord
+	}{
+		move:     move,
+		player:   player,
+		when:     commitAt,
+		newborns: newborns,
+	}
+
+	// 返回给 AI 的“延迟到动画结束”的时长
+	return moveDur + infectDur, nil
 }
 
 //var firstFrame = true
 
 // Update 更新游戏状态
 func (gs *GameScreen) Update() error {
-	//if firstFrame {
-	//	firstFrame = false
-	//	ebiten.SetFPSMode(ebiten.FPSModeVsyncOffMinimum) // 已经进入事件循环，安全
-	//}
 
+	// 扫一遍过期的隐藏
+	//for c, until := range gs.tempHide {
+	//	if time.Now().After(until) {
+	//		delete(gs.tempHide, c)
+	//	}
+	//}
+	// 扫一遍过期的幽灵（未到提交却被其它逻辑打断等）
 	now := time.Now()
-	if !lastUpdate.IsZero() {
-		elapsed := now.Sub(lastUpdate)
-		targetFrameTime := time.Second / 30 // 约等于 33ms
-		if elapsed < targetFrameTime {
-			time.Sleep(targetFrameTime - elapsed) // 主动 sleep 剩余时间
+	kept := gs.tempGhosts[:0]
+	for _, g := range gs.tempGhosts {
+		if now.Before(g.hideAt) {
+			kept = append(kept, g)
 		}
 	}
-	lastUpdate = time.Now()
+	gs.tempGhosts = kept
 
-	// 1) 更新音频
+	// 1) 音频
 	gs.audioManager.Update()
 	if gs.state.GameOver {
 		return nil
@@ -302,81 +358,86 @@ func (gs *GameScreen) Update() error {
 		}
 		i++
 	}
-	// 更新动画标志
+	gs.isAnimating = len(gs.anims) > 0
 
-	// 3) 延迟执行 Clone 落子（在主线程里，绝不会和 Draw 并发）
+	// 3) pendingClone：现在不再在这里做真正落子，直接清空即可（提交由 pendingCommit 统一完成）
 	if pc := gs.pendingClone; pc != nil && time.Now().After(pc.execTime) {
-		// 真正更新棋盘
+		gs.pendingClone = nil
+	}
+
+	// 4) pendingCommit：动画全部结束后，真正把这步写入 Board，并派发“星星眨眼”
+	if pc := gs.pendingCommit; pc != nil && time.Now().After(pc.when) {
+		// —— 先真正更新棋盘 —— //
 		infectedCoords, _, err := gs.state.MakeMove(pc.move)
 		if err != nil {
 			fmt.Println("MakeMove error:", err)
 		} else {
 			if len(infectedCoords) > 0 {
-				//fmt.Println("感染一个棋子，开始跳越")
 				gs.aiJumpUnlocked = true
 			}
-			// 播放感染动画
-			for _, inf := range infectedCoords {
-				gs.addInfectAnim(pc.move.To, inf, pc.player, 0)
-			}
-			// 播放音效
-			var seq []string
-			if pc.player == game.PlayerA {
-				seq = append(seq, "red_split")
-			} else {
-				seq = append(seq, "white_split")
-			}
-			if len(infectedCoords) > 0 {
-				if pc.player == game.PlayerA {
-					seq = append(seq, "red_capture_white_before", "red_capture_white_after")
-				} else {
-					seq = append(seq, "white_capture_red_before", "white_capture_red_after")
-				}
-			}
-			seq = append(seq, "all_capture_after")
-			gs.audioManager.PlaySequential(seq...)
+			// （可选）sparkle
+			// for _, c := range pc.newborns { gs.addSparkleAt(c, 650*time.Millisecond) }
 		}
-		// 清空 pendingClone
-		gs.pendingClone = nil
+
+		// —— 清理“临时隐藏” —— //
+		// 对于跳跃，从旧位移除隐藏（到期时间已过或直接删）
+		delete(gs.tempHide, pc.move.From)
+
+		// —— 清理“幽灵棋子” —— //
+		now := time.Now()
+		kept := gs.tempGhosts[:0]
+		for _, g := range gs.tempGhosts {
+			// 提交后，所有 hideAt <= now 的幽灵都应移除
+			if now.Before(g.hideAt) {
+				kept = append(kept, g)
+			}
+		}
+		gs.tempGhosts = kept
+
+		gs.pendingCommit = nil
 	}
 
-	gs.isAnimating = len(gs.anims) > 0
-
-	// 4) AI 回合
+	// 5) AI 回合（White）
 	if gs.aiEnabled && gs.state.CurrentPlayer == game.PlayerB {
-		if gs.isAnimating || time.Now().Before(gs.aiDelayUntil) {
+		// 任何“动画/提交/AI延迟窗口”期间，都不允许应用AI
+		if gs.isAnimating || gs.pendingCommit != nil || time.Now().Before(gs.aiDelayUntil) {
 			return nil
 		}
-		if move, _, ok := game.IterativeDeepening(gs.state.Board, game.PlayerB, depth, gs.aiJumpUnlocked); ok {
-			if total, err := gs.performMove(move, game.PlayerB); err == nil {
+
+		// 若还没有缓存的 AI 结果：开始“思考阶段”（先显示≥1s思考图标，再应用）
+		if gs.aiQueuedMove == nil {
+			gs.aiThinkingStart = time.Now()
+			gs.aiThinkingUntil = gs.aiThinkingStart.Add(1 * time.Second) // 至少 1s
+			gs.showThinking = true
+
+			if mv, _, ok := game.IterativeDeepening(gs.state.Board, game.PlayerB, depth, gs.aiJumpUnlocked); ok {
+				gs.aiQueuedMove = &mv
+			} else {
+				// 没算出结果就先退出（图标会继续显示一小会儿，下一帧再试也行）
+				return nil
+			}
+			return nil
+		}
+
+		// 已有 AI 结果：等到“思考图标”满 1s 后，再真正应用
+		if time.Now().After(gs.aiThinkingUntil) {
+			mv := *gs.aiQueuedMove
+			gs.aiQueuedMove = nil
+			gs.showThinking = false
+
+			if total, err := gs.performMove(mv, game.PlayerB); err == nil {
+				// 下一次至少推迟到动画结束
 				gs.aiDelayUntil = time.Now().Add(total)
 			}
+			gs.selected = nil
+			return nil
 		}
-		gs.selected = nil
+
+		// 还没满 1s，就继续显示图标，先不应用
 		return nil
 	}
-	//if gs.aiEnabled && gs.state.CurrentPlayer == game.PlayerB {
-	//	if gs.isAnimating || time.Now().Before(gs.aiDelayUntil) {
-	//		return nil
-	//	}
-	//
-	//	// —— MCTS：给“模拟次数”或“时间预算”二选一（另一个填 0）——
-	//	// 例1：固定 4000 次模拟
-	//	mv, ok := game.FindBestMoveMCTS(gs.state.Board, game.PlayerB, 4000, 0, gs.aiJumpUnlocked)
-	//
-	//	// 例2：固定 500ms 时间预算
-	//	//mv, ok := game.FindBestMoveMCTS(gs.state.Board, game.PlayerB, 0, 500*time.Millisecond)
-	//
-	//	if ok {
-	//		if total, err := gs.performMove(mv, game.PlayerB); err == nil {
-	//			gs.aiDelayUntil = time.Now().Add(total)
-	//		}
-	//	}
-	//	gs.selected = nil
-	//	return nil
-	//}
 
-	// 5) 人类回合
+	// 6) 人类回合
 	enterPerf()
 	gs.handleInput()
 	return nil
@@ -391,7 +452,12 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 	gs.offscreen.Fill(color.Black)
 
 	// 3) 所有棋盘+高亮+棋子都画到 offscreen
-	DrawBoardAndPiecesWithHints(
+	skip := map[game.HexCoord]bool{}
+	for c := range gs.tempHide {
+		skip[c] = true
+	}
+
+	gs.drawBoardAndPiecesWithHints(
 		gs.offscreen,
 		gs.state.Board,
 		gs.tileImage,
@@ -399,10 +465,40 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 		gs.hintYellowImage,
 		gs.pieceImages,
 		gs.selected,
+		skip,
 	)
+	// —— 思考图标（右上角）——
+	if gs.showThinking && gs.aiThinkingImg != nil {
+		iw, ih := gs.aiThinkingImg.Bounds().Dx(), gs.aiThinkingImg.Bounds().Dy()
 
+		// 想要固定高度（比如 48px），太大就等比缩放；小于48就原尺寸
+		targetH := 48.0
+		scale := 1.0
+		if float64(ih) > targetH {
+			scale = targetH / float64(ih)
+		}
+
+		// 计算在 offscreen(800x600) 的右上角坐标
+		margin := 12.0
+		drawW := float64(iw) * scale
+		x := float64(WindowWidth) - drawW - margin
+		y := margin
+
+		op := &ebiten.DrawImageOptions{}
+		op.GeoM.Scale(scale, scale)
+		op.GeoM.Translate(x, y)
+		gs.offscreen.DrawImage(gs.aiThinkingImg, op)
+	}
 	boardScale, originX, originY, tileW, tileH, vs := getBoardTransform(gs.tileImage)
 
+	now := time.Now()
+	for _, g := range gs.tempGhosts {
+		if now.Before(g.showAt) || !now.Before(g.hideAt) {
+			continue
+		}
+		// 用与真实棋子相同的 drawPiece 叠加（你也可以降低 alpha 做“淡入”）
+		drawPiece(gs.offscreen, gs.pieceImages[g.player], g.coord, originX, originY, int(tileW), int(tileH), vs, boardScale)
+	}
 	// —— 新增：把评分画到每个目标格的中心 ——
 	if gs.showScores {
 		for to, score := range gs.ui.MoveScores {

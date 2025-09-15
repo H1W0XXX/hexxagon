@@ -139,6 +139,49 @@ func drawHexHintXY(
 	dst.DrawImage(img, op)
 }
 
+// 新函数：一次性烘焙静态棋盘（底色+紫环+渐变）
+func (gs *GameScreen) bakeBoardBase() {
+	w, h := WindowWidth, WindowHeight
+	if gs.boardBaked == nil || gs.boardBaked.Bounds().Dx() != w || gs.boardBaked.Bounds().Dy() != h {
+		gs.boardBaked = ebiten.NewImage(w, h)
+	}
+	img := ebiten.NewImage(w, h) // 临时层：先画底色+紫环
+	img.Clear()
+
+	// 复用你原来的坐标计算
+	tileW := gs.tileImage.Bounds().Dx()
+	tileH := gs.tileImage.Bounds().Dy()
+	vs := float64(tileH) * math.Sqrt(3) / 2
+	cols := 2*BoardRadius + 1
+	rows := 2*BoardRadius + 1
+	boardW := float64(cols-1)*float64(tileW)*0.75 + float64(tileW)
+	boardH := vs*float64(rows-1) + float64(tileH)
+	scale := math.Min(float64(WindowWidth)/boardW, float64(WindowHeight)/boardH)
+	originX := (float64(WindowWidth) - boardW*scale) / 2
+	originY := (float64(WindowHeight) - boardH*scale) / 2
+
+	base := hexBase(tileW, tileH, color.RGBA{49, 83, 127, 0xFF})
+	hintSY := 0.9
+	hintSX := 1.05
+	for i := 0; i < game.BoardN; i++ {
+		if gs.state.Board.Cells[i] == game.Blocked {
+			continue
+		}
+		c := game.CoordOf[i]
+		drawHexHintXY(img, base, c, originX, originY, tileW, tileH, vs, scale, hintSX, hintSY)
+		drawHexHintXY(img, gs.tileImage, c, originX, originY, tileW, tileH, vs, scale, hintSX, hintSY)
+	}
+
+	// 一次性应用渐变 shader -> 写入 boardBaked
+	gs.boardBaked.Clear()
+	op := &ebiten.DrawRectShaderOptions{}
+	op.Images[0] = img
+	op.Uniforms = map[string]any{"UBright": float32(1.35), "UDark": float32(0.70)}
+	gs.boardBaked.DrawRectShader(w, h, gradShader, op)
+
+	gs.boardBakedOK = true
+}
+
 // 添加一个用于缓存渐变结果的变量，避免每帧重新计算
 var (
 	lastBoardLayer *ebiten.Image
@@ -146,7 +189,8 @@ var (
 )
 
 // DrawBoardAndPiecesWithHints 在 dst 上绘制棋盘、提示和棋子。
-func DrawBoardAndPiecesWithHints(
+// 由: func DrawBoardAndPiecesWithHints(...)
+func (gs *GameScreen) drawBoardAndPiecesWithHints(
 	dst *ebiten.Image,
 	board *game.Board,
 	tileImg *ebiten.Image,
@@ -154,24 +198,31 @@ func DrawBoardAndPiecesWithHints(
 	hintYellowImg *ebiten.Image,
 	pieceImgs map[game.CellState]*ebiten.Image,
 	selected *game.HexCoord,
+	skipPieces map[game.HexCoord]bool,
 ) {
 	// 清空目标图像
 	dst.Clear()
 
-	// 0) 预计算 cloneTargets/jumpTargets
+	// —— 预烘焙的棋盘底图（含六边形+紫环+渐变）——
+	if !gs.boardBakedOK {
+		gs.bakeBoardBase()
+	}
+	dst.DrawImage(gs.boardBaked, nil)
+
+	// 计算绘制所需的几何参数（给提示圈/棋子用）
+	scale, originX, originY, tileW, tileH, vs := boardTransform(tileImg)
+
+	// 预计算可落点（不变）
 	cloneTargets := map[game.HexCoord]struct{}{}
 	jumpTargets := map[game.HexCoord]struct{}{}
 	if selected != nil {
 		from := *selected
-		fromIdx, ok := game.IndexOf[from] // 坐标转下标
-		if ok {
-			// 克隆目标：1 步邻居
+		if fromIdx, ok := game.IndexOf[from]; ok {
 			for _, toIdx := range game.NeighI[fromIdx] {
 				if board.Cells[toIdx] == game.Empty {
 					cloneTargets[game.CoordOf[toIdx]] = struct{}{}
 				}
 			}
-			// 跳跃目标：2 步邻居
 			for _, toIdx := range game.JumpI[fromIdx] {
 				if board.Cells[toIdx] == game.Empty {
 					jumpTargets[game.CoordOf[toIdx]] = struct{}{}
@@ -180,62 +231,9 @@ func DrawBoardAndPiecesWithHints(
 		}
 	}
 
-	// 1) 计算瓦片原始尺寸与竖直行高
-	tileW := tileImg.Bounds().Dx()
-	tileH := tileImg.Bounds().Dy()
-	vs := float64(tileH) * math.Sqrt(3) / 2
-
-	// 2) 计算棋盘在原始尺寸下的宽高
-	cols := 2*BoardRadius + 1
-	rows := 2*BoardRadius + 1
-	boardW := float64(cols-1)*float64(tileW)*0.75 + float64(tileW)
-	boardH := vs*float64(rows-1) + float64(tileH)
-
-	// 3) 同时适配宽度和高度：scaleX, scaleY，取最小值
-	scaleX := float64(WindowWidth) / boardW
-	scaleY := float64(WindowHeight) / boardH
-	scale := math.Min(scaleX, scaleY)
-
-	// 4) 计算居中偏移：让棋盘在 dst（800×600）中央
-	originX := (float64(WindowWidth) - boardW*scale) / 2
-	originY := (float64(WindowHeight) - boardH*scale) / 2
-
-	// 5) 先把"整盘底板（底色+紫环）"画到一个临时层 boardLayer
-	boardLayer := ebiten.NewImage(WindowWidth, WindowHeight)
-	base := hexBase(tileW, tileH, color.RGBA{49, 83, 127, 0xFF})
-
-	// 想要上下各多出 gapY 像素（屏幕像素）
-	hintSY := 0.9
-	hintSX := 1.05
-	for i := 0; i < game.BoardN; i++ {
-		if board.Cells[i] == game.Blocked {
-			continue
-		}
-		c := game.CoordOf[i]
-		drawHexHintXY(boardLayer, base, c, originX, originY, tileW, tileH, vs, scale, hintSX, hintSY)
-		// 再叠紫环贴图
-		drawHexHintXY(boardLayer, tileImg, c, originX, originY, tileW, tileH, vs, scale, hintSX, hintSY)
-	}
-
-	// 6) 检查是否需要重新生成渐变（避免每帧都重新计算）
-	needsUpdate := lastBoardLayer == nil || cachedShaded == nil
-	if needsUpdate {
-		// 用 Shader 对"整盘底板"做一次左上亮→右下暗的乘性渐变
-		cachedShaded = ebiten.NewImage(WindowWidth, WindowHeight)
-		op := &ebiten.DrawRectShaderOptions{}
-		op.Images[0] = boardLayer // 确保 shader 有输入图像
-		op.Uniforms = map[string]any{
-			"UBright": float32(1.35),
-			"UDark":   float32(0.70),
-		}
-		cachedShaded.DrawRectShader(WindowWidth, WindowHeight, gradShader, op)
-		lastBoardLayer = boardLayer
-	}
-
-	// 7) 把渐变结果画到 dst
-	dst.DrawImage(cachedShaded, nil)
-
-	// 克隆/跳跃目标分别画（用已有的集合）
+	// 提示圈（你的视觉参数保持一致）
+	const hintSX = 1.05
+	const hintSY = 0.90
 	for _, c := range board.AllCoords() {
 		if _, ok := cloneTargets[c]; ok {
 			drawHexHintXY(dst, hintGreenImg, c, originX, originY, tileW, tileH, vs, scale, hintSX, hintSY)
@@ -247,33 +245,20 @@ func DrawBoardAndPiecesWithHints(
 		}
 	}
 
-	// 9) 最后绘制棋子
+	// 棋子
 	for i := 0; i < game.BoardN; i++ {
 		st := board.Cells[i]
-		if st == game.PlayerA || st == game.PlayerB {
-			c := game.CoordOf[i]
-			drawPiece(dst, pieceImgs[st], c, originX, originY, tileW, tileH, vs, scale)
+		if st != game.PlayerA && st != game.PlayerB {
+			continue
 		}
-	}
+		c := game.CoordOf[i]
 
-	// +++ —— 在每个网格中心绘制轴坐标 (q,r) —— +++
-	//for i := 0; i < game.BoardN; i++ {
-	//	if board.Cells[i] == game.Blocked {
-	//		continue
-	//	}
-	//	c := game.CoordOf[i]
-	//
-	//	// 计算该格中心的屏幕坐标（与你其他函数一致）
-	//	x0 := (float64(c.Q) + float64(BoardRadius)) * float64(tileW) * 0.75
-	//	y0 := (float64(c.R) + float64(BoardRadius) + float64(c.Q)/2) * vs
-	//	cx := originX + (x0+float64(tileW)/2)*scale
-	//	cy := originY + (y0+float64(tileH)/2)*scale
-	//
-	//	// 阴影 + 本体，提升对比度
-	//	label := fmt.Sprintf("%d,%d", c.Q, c.R)
-	//	drawTextCentered(dst, label, cx+1, cy+1, color.RGBA{0, 0, 0, 255})   // shadow
-	//	drawTextCentered(dst, label, cx, cy, color.RGBA{250, 250, 250, 255}) // text
-	//}
+		// 跳过临时隐藏（跳跃旧位）
+		if skipPieces != nil && skipPieces[c] {
+			continue
+		}
+		drawPiece(dst, pieceImgs[st], c, originX, originY, tileW, tileH, vs, scale)
+	}
 }
 
 // drawHexHint 专门用于绘制提示框，支持缩放避免重叠
