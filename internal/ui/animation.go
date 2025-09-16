@@ -21,25 +21,25 @@ type FrameAnim struct {
 	From       game.HexCoord // 新增：动画发起位置
 	To         game.HexCoord // 目标格
 	MidX, MidY float64       // new: pixel midpoint in offscreen coords
-
+	FrameIndex int
 }
 
 func (a *FrameAnim) Current() *ebiten.Image {
-	if a.Done || len(a.Frames) == 0 {
+	if len(a.Frames) == 0 {
 		return nil
 	}
 	elapsed := time.Since(a.Start).Seconds()
-	// 延迟播放：还没到 Start，就返回 nil
 	if elapsed < 0 {
-		return nil
+		a.FrameIndex = 0
+		return nil // 尚未到起始时间
 	}
 	idx := int(elapsed * a.FPS)
-	//fmt.Printf("Anim Current: elapsed=%.3f idx=%d/%d done=%v\n",
-	//	elapsed, idx, len(a.Frames), a.Done)
 	if idx >= len(a.Frames) {
+		a.FrameIndex = len(a.Frames) - 1
 		a.Done = true
-		return nil
+		return a.Frames[a.FrameIndex] // 返回最后一帧，避免渲染端取不到索引
 	}
+	a.FrameIndex = idx
 	return a.Frames[idx]
 }
 
@@ -58,10 +58,10 @@ func (gs *GameScreen) startInfectAnim(from, to game.HexCoord, player game.CellSt
 	key := [2]int{dq, dr}
 
 	base := "redEatWhite"
-	if player == game.PlayerB { // 白吃红，用另一套
+	if player == game.PlayerB { // 白吃红
 		base = "whiteEatRed"
 	}
-	frames := assets.AnimFrames[base] // 左→右 素材
+	frames := assets.AnimFrames[base]
 
 	anim := &FrameAnim{
 		Frames: frames,
@@ -69,6 +69,7 @@ func (gs *GameScreen) startInfectAnim(from, to game.HexCoord, player game.CellSt
 		Start:  time.Now(),
 		Coord:  to,            // 在被感染格播放
 		Angle:  dirAngle[key], // 旋转角
+		Key:    base,          // ✅ 渲染时要用来查 trimOffsets / AnimOffset
 	}
 	gs.anims = append(gs.anims, anim)
 }

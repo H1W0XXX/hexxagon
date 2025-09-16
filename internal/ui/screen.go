@@ -95,6 +95,8 @@ type GameScreen struct {
 	aiRunning  bool           // 是否有AI在后台跑
 
 	hideWindows []timedHide
+
+	didShrink bool
 }
 
 type timedHide struct {
@@ -152,6 +154,26 @@ func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen,
 	if gs.aiThinkingImg, err = assets.LoadImage("aiThinking"); err != nil {
 		return nil, fmt.Errorf("加载 aiThinking.png 失败: %w", err)
 	}
+
+	// —— 计算合适的缩放，并缩小贴图（尺寸视觉不变，显存大降） —— //
+	// 用“未缩的 tileImage”先算一遍当前 boardScale
+	//boardScaleBefore, _, _, _, _, _ := getBoardTransform(gs.tileImage)
+
+	// 根据目标清晰度=2×屏幕像素，得出统一缩放值
+	//setSpriteScale(boardScaleBefore)
+
+	// 缩小动画帧 & 动画锚点
+	//shrinkAllSprites()
+
+	// 把静态贴图也缩一下（棋格/棋子/提示圈/思考图标）
+	gs.tileImage = scaleImage(gs.tileImage, spriteScale)
+	gs.pieceImages[game.PlayerA] = scaleImage(gs.pieceImages[game.PlayerA], spriteScale)
+	gs.pieceImages[game.PlayerB] = scaleImage(gs.pieceImages[game.PlayerB], spriteScale)
+	gs.hintGreenImage = scaleImage(gs.hintGreenImage, spriteScale)
+	gs.hintYellowImage = scaleImage(gs.hintYellowImage, spriteScale)
+	gs.aiThinkingImg = scaleImage(gs.aiThinkingImg, spriteScale)
+	// 注意：boardScale 将在每帧由 getBoardTransform(gs.tileImage) 重新计算，
+	// 因为 tile 变小了，boardScale 会自动变大，两者互相抵消，屏幕尺寸保持不变。
 
 	// 如果启动时就要显示评分，先计算一次
 	if gs.showScores {
@@ -295,7 +317,13 @@ func (gs *GameScreen) performMove(move game.Move, player game.CellState) (time.D
 func (gs *GameScreen) Update() error {
 	now := time.Now()
 
-	// 修复4：调整处理顺序，先处理pendingCommit，再清理幽灵和隐藏
+	if !gs.didShrink {
+		// 需要的话先计算 spriteScale（固定值就不用算）
+		// setSpriteScale(boardScaleBefore)  // 如果你走自动模式
+
+		shrinkAllSprites() // << 这里调用，ReadPixels 就不会报错了
+		gs.didShrink = true
+	}
 
 	// 1) 音频更新
 	gs.audioManager.Update()
@@ -541,7 +569,10 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 			// —— 变色动画：与普通动画用同一锚点/偏移，唯一差别：不旋转 —— //
 			data := assets.AnimDatas[a.Key]
 			ax, ay := data.AX, data.AY
-			off := AnimOffset[a.Key]
+
+			// 🚩改这里：读取“按统一缩放后”的偏移
+			ox, oy := getScaledOffset(a.Key)
+			tx, ty := getTrimOffset(a.Key, a.FrameIndex)
 
 			// 先把帧图的动画锚点移到 (0,0)
 			op.GeoM.Translate(-ax, -ay)
@@ -551,20 +582,23 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 			op.GeoM.Scale(boardScale, boardScale)
 
 			// 贴到目标格的左上 + (ax,ay) + 偏移
-			x0 := (float64(a.Coord.Q)+BoardRadius)*float64(tileW)*0.75 + ax + off.X
-			y0 := (float64(a.Coord.R)+BoardRadius+float64(a.Coord.Q)/2)*vs + ay + off.Y
+			x0 := (float64(a.Coord.Q)+BoardRadius)*float64(tileW)*0.75 + ax + ox + tx
+			y0 := (float64(a.Coord.R)+BoardRadius+float64(a.Coord.Q)/2)*vs + ay + oy + ty
 			op.GeoM.Translate(originX+x0*boardScale, originY+y0*boardScale)
 		} else {
 			// —— 普通动画：保持老逻辑 —— //
 			data := assets.AnimDatas[a.Key]
 			ax, ay := data.AX, data.AY
-			off := AnimOffset[a.Key]
+
+			// 🚩改这里：读取“按统一缩放后”的偏移
+			ox, oy := getScaledOffset(a.Key)
+			tx, ty := getTrimOffset(a.Key, a.FrameIndex)
 
 			op.GeoM.Translate(-ax, -ay)
 			op.GeoM.Rotate(a.Angle)
 			op.GeoM.Scale(boardScale, boardScale)
-			x0 := (float64(a.Coord.Q)+BoardRadius)*float64(tileW)*0.75 + ax + off.X
-			y0 := (float64(a.Coord.R)+BoardRadius+float64(a.Coord.Q)/2)*vs + ay + off.Y
+			x0 := (float64(a.Coord.Q)+BoardRadius)*float64(tileW)*0.75 + ax + ox + tx
+			y0 := (float64(a.Coord.R)+BoardRadius+float64(a.Coord.Q)/2)*vs + ay + oy + ty
 			op.GeoM.Translate(originX+x0*boardScale, originY+y0*boardScale)
 		}
 
