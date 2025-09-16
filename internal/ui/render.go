@@ -32,6 +32,8 @@ func Fragment(pos vec4, uv vec2, col vec4) vec4 {
 
 var gradShader *ebiten.Shader
 
+const tipSearchDepth = depth
+
 func init() {
 	s, err := ebiten.NewShader([]byte(gradKage))
 	if err != nil {
@@ -399,9 +401,9 @@ func (gs *GameScreen) refreshMoveScores() {
 			continue
 		}
 
-		// 用静态评估（或深度=0 的 AlphaBetaNoTT）
+		// Use depth-4 AlphaBeta search (TT accelerated) for the score
 		// score := game.AlphaBetaNoTT(bCopy, player, 0)
-		score := game.Evaluate(bCopy, player)
+		score := game.AlphaBeta(bCopy, player, tipSearchDepth)
 
 		gs.ui.MoveScores[mv.To] = float64(score)
 	}

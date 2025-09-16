@@ -327,6 +327,17 @@ func (gs *GameScreen) Update() error {
 
 	// 1) 音频更新
 	gs.audioManager.Update()
+
+	// 2) prune finished animations before handling game over
+	for i := 0; i < len(gs.anims); {
+		if gs.anims[i].Done {
+			gs.anims = append(gs.anims[:i], gs.anims[i+1:]...)
+			continue
+		}
+		i++
+	}
+	gs.isAnimating = len(gs.anims) > 0
+
 	if gs.state.GameOver {
 		if gs.aiRunning {
 			close(gs.aiCancelCh)
@@ -338,16 +349,6 @@ func (gs *GameScreen) Update() error {
 		gs.aiDelayUntil = time.Time{}
 		return nil
 	}
-
-	// 2) 清理已结束的动画
-	for i := 0; i < len(gs.anims); {
-		if gs.anims[i].Done {
-			gs.anims = append(gs.anims[:i], gs.anims[i+1:]...)
-			continue
-		}
-		i++
-	}
-	gs.isAnimating = len(gs.anims) > 0
 
 	// 3) pendingClone清理
 	if pc := gs.pendingClone; pc != nil && now.After(pc.execTime) {
