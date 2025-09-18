@@ -49,9 +49,9 @@ func (m Move) ApplyPreview(b *Board, player CellState) (infected int, ok bool) {
 }
 
 // 对外导出
-func Evaluate(b *Board, player CellState) int {
-	return evaluateStatic(b, player)
-}
+//func Evaluate(b *Board, player CellState) int {
+//	return evaluateStatic(b, player)
+//}
 
 func isOuter(c HexCoord, _ int) bool {
 	idx, ok := IndexOf[c] // 你已有的“坐标 -> 下标”映射
@@ -234,7 +234,7 @@ func weakSupportCount(b *Board, side CellState) int {
 	return bad
 }
 
-func evaluateStatic(b *Board, player CellState) int {
+func EvaluateStatic(b *Board, player CellState) int {
 	op := Opponent(player)
 
 	// 子数差

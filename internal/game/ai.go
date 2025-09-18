@@ -19,7 +19,7 @@ func init() {
 
 // const useLearned = true
 const useLearned = false
-const useLearned2 = true
+const useLearned2 = false
 const jumpMovePenalty = 25
 
 // ------------------------------------------------------------
@@ -125,7 +125,7 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 			if useLearned {
 				return HybridEval(b, player)
 			}
-			return evaluateStatic(b, player)
+			return EvaluateBitBoard(b, player)
 		}()
 		// 轻量启发：感染数加权，能明显稳定排序（尤其早中期）
 		inf := previewInfectedCount(b, m, player)
@@ -284,7 +284,7 @@ func alphaBeta(
 		if useLearned {
 			valOrig = HybridEval(b, original)
 		} else {
-			valOrig = evaluateStatic(b, original)
+			valOrig = EvaluateBitBoard(b, original)
 		}
 
 		// 存 TT 用 current 视角（与 key 里的 current 对齐）
@@ -545,7 +545,7 @@ func alphaBetaNoTT(
 ) int {
 	// 递归终止：深度到 0 或无空位
 	if depth == 0 || b.CountPieces(PlayerA)+b.CountPieces(PlayerB) == len(b.AllCoords()) {
-		return evaluateStatic(b, original)
+		return EvaluateBitBoard(b, original)
 	}
 
 	moves := GenerateMoves(b, current)

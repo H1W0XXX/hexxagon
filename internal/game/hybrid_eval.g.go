@@ -65,7 +65,7 @@ func PhaseSelectEval(b *Board, me CellState) int {
 		v := EvaluateNN(b, me)
 		return v
 	}
-	return evaluateStatic(b, me)
+	return EvaluateStatic(b, me)
 }
 
 // 统计空位比例
@@ -83,7 +83,7 @@ func emptyRatio(b *Board) float64 {
 // HybridEval: 叶子用它；根排序也可以用它（再叠轻启发）
 func HybridEval(b *Board, me CellState) int {
 	// 1) 先拿两路分
-	staticVal := evaluateStatic(b, me) // 你已有的静态评估
+	staticVal := EvaluateStatic(b, me) // 你已有的静态评估
 	nnVal := 0
 	nnOk := true
 	{
@@ -206,7 +206,7 @@ func FindBestMoveAtDepthHybrid(b *Board, player CellState, depth int64, allowJum
 			if useLearned2 {
 				return EvaluateNN(b, player)
 			}
-			return evaluateStatic(b, player)
+			return EvaluateStatic(b, player)
 		}()
 		// 轻量启发：感染数加权，能明显稳定排序（尤其早中期）
 		inf := previewInfectedCount(b, m, player)

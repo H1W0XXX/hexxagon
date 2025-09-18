@@ -46,11 +46,14 @@ var (
 var zobCell [BoardN][4]uint64           // [index][state]
 func zobKeyI(i int, s CellState) uint64 { return zobristCell[i][s] }
 
+var ttSalt uint64 // 与 zobrist/side xor 组成最终 key
 // init 在程序启动时执行一次，生成所有随机键。
 func init() {
 	initBoardTables()
 	initZobrist()
 	initEncodeTables()
+	// 初始化一个随机盐，避免进程内碰撞
+	atomic.StoreUint64(&ttSalt, rand.Uint64()|1) // 确保非零
 }
 func initZobrist() {
 	onceZobristInit.Do(func() {
@@ -78,7 +81,15 @@ func initZobrist() {
 }
 
 func ttKeyFor(b *Board, current CellState) uint64 {
-	return b.hash ^ zobristSide[sideIdx(current)]
+	return b.hash ^ zobristSide[sideIdx(current)] ^ atomic.LoadUint64(&ttSalt)
+}
+
+func ClearTT() {
+	// 换个盐：让所有旧 key 立刻无法命中
+	atomic.AddUint64(&ttSalt, 1)
+	// 统计计数也一起清零
+	atomic.StoreUint64(&ttProbeCount, 0)
+	atomic.StoreUint64(&ttHitCount, 0)
 }
 
 // 读：循环直到拿到稳定快照（version 偶数且前后一致）
