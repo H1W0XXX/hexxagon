@@ -461,8 +461,10 @@ func (gs *GameScreen) Update() error {
 	}
 
 	// 8) 人类输入处理
-	enterPerf()
 	gs.handleInput()
+	markBooted()
+
+	ensurePerf(gs.isAnimating || gs.aiRunning || gs.aiQueuedMove != nil || gs.selected != nil)
 	return nil
 }
 

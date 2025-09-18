@@ -109,7 +109,7 @@ func (gs *GameScreen) handleInput() {
 		if gs.state.Board.Cells[toIdx] == player { // 数组下标直读
 			gs.selected = &game.HexCoord{Q: coord.Q, R: coord.R}
 			gs.audioManager.Play("select_piece")
-
+			enterPerf()
 			// === 评分提示（只算从该起点出的走法）===
 			gs.ui.From = gs.selected
 			gs.ui.MoveScores = make(map[game.HexCoord]float64)
@@ -175,7 +175,10 @@ func (gs *GameScreen) handleInput() {
 		if gs.state.Board.Cells[toIdx] == player {
 			gs.selected = &game.HexCoord{Q: coord.Q, R: coord.R}
 			gs.audioManager.Play("select_piece")
-			gs.refreshMoveScores()
+			if gs.showScores {
+				gs.refreshMoveScores()
+			}
+
 		} else {
 			gs.selected = nil
 			gs.audioManager.Play("cancel_select_piece")
@@ -186,6 +189,7 @@ func (gs *GameScreen) handleInput() {
 	// 真正落子
 	if total, err := gs.performMove(move, player); err != nil {
 		if gs.state.Board.Cells[toIdx] == player {
+
 			gs.selected = &game.HexCoord{Q: coord.Q, R: coord.R}
 			gs.audioManager.Play("select_piece")
 		} else {
@@ -196,7 +200,10 @@ func (gs *GameScreen) handleInput() {
 		// 成功：设置 AI 延迟并清空选中
 		gs.aiDelayUntil = time.Now().Add(total)
 		gs.selected = nil
-		leavePerf()
+
 	}
-	gs.refreshMoveScores()
+	if gs.showScores {
+		gs.refreshMoveScores()
+	}
+
 }
