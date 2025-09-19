@@ -4,6 +4,7 @@ package game
 import (
 	_ "embed"
 	"log"
+	"math"
 	"runtime"
 
 	//"errors"
@@ -190,10 +191,32 @@ func encodeBoard(b *Board, me CellState, dst []float32) {
 }
 
 // 只取 value 头做静态评估（返回 int，方便接到你的评分框架）
+//func EvaluateNN(b *Board, me CellState) int {
+//	if err := ensureONNX(); err != nil {
+//		// 回退到旧静态评估也行：
+//		// return evaluateStatic(b, me)
+//		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
+//		return 0
+//	}
+//	// 填充输入
+//	data := inTensor.GetData()
+//	encodeBoard(b, me, data)
+//
+//	// 跑一次
+//	ortMu.Lock()
+//	err := ortSess.Run()
+//	ortMu.Unlock()
+//	if err != nil {
+//		return 0
+//	}
+//	// 读取 value，范围(-1,1)，放大到可比较的整数
+//	v := outV.GetData()[0]
+//	return int(v * 100.0)
+//}
+
 func EvaluateNN(b *Board, me CellState) int {
 	if err := ensureONNX(); err != nil {
-		// 回退到旧静态评估也行：
-		// return evaluateStatic(b, me)
+		// 回退到旧静态评估
 		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
 		return 0
 	}
@@ -208,12 +231,36 @@ func EvaluateNN(b *Board, me CellState) int {
 	if err != nil {
 		return 0
 	}
-	// 读取 value，范围(-1,1)，放大到可比较的整数
-	v := outV.GetData()[0]
-	return int(v * 100.0)
+	// 读取 value，logits -> sigmoid 转换为概率
+	vLogit := outV.GetData()[0]
+	vProb := 1 / (1 + math.Exp(float64(-vLogit))) // Sigmoid
+
+	// 将概率放大为整数，方便评估
+	return int(vProb * 100.0)
 }
 
 // 可选：拿策略头（81 logits，自己在 Go 侧做 mask/softmax/挑选）
+//func PolicyNN(b *Board, me CellState) ([]float32, error) {
+//	if err := ensureONNX(); err != nil {
+//		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
+//		return nil, err
+//	}
+//	// 输入
+//	data := inTensor.GetData()
+//	encodeBoard(b, me, data)
+//
+//	ortMu.Lock()
+//	err := ortSess.Run()
+//	ortMu.Unlock()
+//	if err != nil {
+//		return nil, err
+//	}
+//	logits := make([]float32, policyOutDim)
+//	copy(logits, outP.GetData())
+//	// 这里不做 softmax；若需要概率，再减去 max 然后做 exp/sum
+//	return logits, nil
+//}
+
 func PolicyNN(b *Board, me CellState) ([]float32, error) {
 	if err := ensureONNX(); err != nil {
 		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
@@ -223,16 +270,31 @@ func PolicyNN(b *Board, me CellState) ([]float32, error) {
 	data := inTensor.GetData()
 	encodeBoard(b, me, data)
 
+	// 跑一次
 	ortMu.Lock()
 	err := ortSess.Run()
 	ortMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
+
+	// 获取 policy logits
 	logits := make([]float32, policyOutDim)
 	copy(logits, outP.GetData())
-	// 这里不做 softmax；若需要概率，再减去 max 然后做 exp/sum
-	return logits, nil
+
+	// 如果你需要概率，可以做 softmax：
+	// softmax
+	expSum := float32(0)
+	for _, logit := range logits {
+		expSum += float32(math.Exp(float64(logit)))
+	}
+	softmax := make([]float32, len(logits))
+	for i, logit := range logits {
+		softmax[i] = float32(math.Exp(float64(logit))) / expSum
+	}
+	// softmax 数组包含每个动作的概率
+
+	return softmax, nil
 }
 
 // —— 小工具 ——

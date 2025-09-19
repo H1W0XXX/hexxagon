@@ -66,7 +66,7 @@ func main() {
 	}
 	//ebiten.SetFPSMode(ebiten.FPSModeVsyncOffMinimum)
 	ebiten.SetVsyncEnabled(true)
-	ebiten.SetTPS(30)
+	ebiten.SetTPS(60)
 	ebiten.SetWindowSize(screenW*ScreenScale, screenH*ScreenScale)
 	ebiten.SetWindowTitle("Hexxagon")
 

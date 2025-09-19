@@ -12,7 +12,7 @@ func enterPerf() {
 		return
 	}
 	ebiten.SetFPSMode(ebiten.FPSModeVsyncOn)
-	ebiten.SetMaxTPS(30)
+	ebiten.SetTPS(10)
 	perfOn = true
 }
 
@@ -21,7 +21,7 @@ func leavePerf(force bool) {
 		return
 	}
 	ebiten.SetFPSMode(ebiten.FPSModeVsyncOffMinimum)
-	ebiten.SetMaxTPS(10)
+	ebiten.SetTPS(60)
 	perfOn = false
 }
 

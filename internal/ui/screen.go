@@ -193,9 +193,13 @@ func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen,
 	return gs, nil
 }
 
-var frameEps = time.Second / 60
+var frameEps = time.Second / 30
 
 // performMove 执行一次完整落子，返回本次行动需要的总耗时（用于 aiDelayUntil）
+// 在 performMove 函数中，修改幽灵棋子的时机设置
+
+// 在 performMove 函数中，修改幽灵棋子的时机设置
+
 func (gs *GameScreen) performMove(move game.Move, player game.CellState) (time.Duration, error) {
 	baseNow := time.Now()
 	gs.isAnimating = true
@@ -232,12 +236,13 @@ func (gs *GameScreen) performMove(move game.Move, player game.CellState) (time.D
 			gs.addInfectAnim(move.To, inf, player, moveDur)
 			gs.addBecomeAnim(inf, player, moveDur+infectDur)
 
-			// 修复1：增加更长的缓冲时间，确保稳定过渡
-			bufferTime := 3 * frameEps // 增加到3帧的缓冲
+			becomeStart := baseNow.Add(moveDur + infectDur)
+			becomeEnd := baseNow.Add(moveDur + infectDur + becomeDur)
+
 			gs.hideWindows = append(gs.hideWindows, timedHide{
 				coord: inf,
-				start: baseNow.Add(moveDur + infectDur),
-				end:   baseNow.Add(moveDur + infectDur + becomeDur + bufferTime),
+				start: becomeStart.Add(-frameEps),
+				end:   becomeEnd,
 			})
 		}
 	} else {
@@ -271,15 +276,17 @@ func (gs *GameScreen) performMove(move game.Move, player game.CellState) (time.D
 		gs.audioManager.PlaySequential(seq...)
 	})
 
-	// 修复2：提前提交时间，让真实棋盘状态更早生效
-	commitAt := baseNow.Add(moveDur + infectDur + becomeDur - frameEps) // 提前1帧提交
+	// 🔧 关键修改：让真实棋子和幽灵棋子完美衔接
+	commitAt := baseNow.Add(moveDur + infectDur + becomeDur)
 
-	// 修复3：幽灵棋子延后消失，确保与真实棋子无缝衔接
-	showAt := baseNow.Add(moveDur - frameEps)
+	//showAt := baseNow.Add(moveDur - frameEps/2)
+	showAt := baseNow.Add(moveDur)
 	if showAt.Before(baseNow) {
 		showAt = baseNow
 	}
-	hideAt := commitAt.Add(2 * frameEps) // 延后2帧消失，确保真实棋子已经显示
+
+	// 🔧 修复关键：幽灵棋子应该在真实棋子出现后再消失，确保无缝衔接
+	hideAt := commitAt.Add(frameEps * 3)
 
 	gs.tempGhosts = append(gs.tempGhosts, tempGhost{
 		coord:  move.To,
@@ -288,6 +295,14 @@ func (gs *GameScreen) performMove(move game.Move, player game.CellState) (time.D
 		hideAt: hideAt,
 	})
 
+	// ✅ 关键：to 位的隐藏只在"跳跃"时生效，克隆不隐藏
+	if move.IsJump() {
+		gs.hideWindows = append(gs.hideWindows, timedHide{
+			coord: move.To,
+			start: showAt,
+			end:   hideAt,
+		})
+	}
 	if move.IsJump() {
 		gs.tempHide[move.From] = struct{}{}
 	}
@@ -379,16 +394,19 @@ func (gs *GameScreen) Update() error {
 	// 5) 处理隐藏窗口（在pendingCommit之后）
 	kept := gs.hideWindows[:0]
 	for _, w := range gs.hideWindows {
-		if !w.active && now.After(w.start) {
+		// >= start 当帧就生效
+		if !w.active && !now.Before(w.start) {
 			gs.tempHide[w.coord] = struct{}{}
 			w.active = true
 		}
-		if now.After(w.end) {
-			// 只在pendingCommit已处理后才恢复显示
+
+		// >= end 当帧就解除（仍保留 pendingCommit == nil 的保护）
+		if !now.Before(w.end) {
 			if gs.pendingCommit == nil {
 				delete(gs.tempHide, w.coord)
 				continue
 			}
+
 		}
 		kept = append(kept, w)
 	}
@@ -518,7 +536,7 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 
 	now := time.Now()
 	for _, g := range gs.tempGhosts {
-		if now.Before(g.showAt) || !now.Before(g.hideAt) {
+		if now.Before(g.showAt) || now.After(g.hideAt) {
 			continue
 		}
 		// 用与真实棋子相同的 drawPiece 叠加（你也可以降低 alpha 做“淡入”）
