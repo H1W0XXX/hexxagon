@@ -50,55 +50,46 @@ func policyPruneRoot(b *Board, player CellState, moves []Move) []Move {
 		return moves
 	}
 
-	logits, err := PolicyNN(b, player) // 81 个logit（未softmax）
-	if err != nil || len(logits) != 81 {
+	logits, _, err := KataPolicyValue(b, player) // policy 已经 softmax & 掩蔽，len=82(含pass)
+	if err != nil || len(logits) < 81 {
 		return moves // 推理失败就不动
 	}
 
-	type rec struct {
-		mv    Move
-		logit float64
-		p     float64
-		inf   int
-	}
-	recs := make([]rec, 0, len(moves))
+type rec struct {
+	mv    Move
+	p     float64
+	inf   int
+}
+recs := make([]rec, 0, len(moves))
 
-	// 先收集每个合法走法的 logit 与“即时感染数”
-	maxLogit := -math.MaxFloat64
+	// 先收集每个合法走法的概率与“即时感染数”
 	for _, m := range moves {
 		idx := toIndex9(b, m.To)
-		l := -1e30 // 越界/异常给予极小
+		p := 0.0
 		if idx >= 0 && idx < len(logits) {
-			l = float64(logits[idx])
-		}
-		if l > maxLogit {
-			maxLogit = l
+			p = float64(logits[idx])
 		}
 		recs = append(recs, rec{
 			mv:    m,
-			logit: l,
+			p:     p,
 			inf:   instantInfect(b, m, player),
 		})
 	}
-
-	// 在“合法招法集合”上做 softmax，数值稳定化（减去 max）
-	// 可加温度以调尖/平
+	// 归一化（保险起见）
 	var sum float64
-	for i := range recs {
-		x := (recs[i].logit - maxLogit) / math.Max(policyTemp, 1e-6)
-		recs[i].p = math.Exp(x)
-		sum += recs[i].p
+	for _, r := range recs {
+		sum += r.p
 	}
-	if sum == 0 {
+	if sum > 0 {
+		inv := 1.0 / sum
+		for i := range recs {
+			recs[i].p *= inv
+		}
+	} else {
 		// 退化：全等概率
 		u := 1.0 / float64(len(recs))
 		for i := range recs {
 			recs[i].p = u
-		}
-	} else {
-		inv := 1.0 / sum
-		for i := range recs {
-			recs[i].p *= inv
 		}
 	}
 

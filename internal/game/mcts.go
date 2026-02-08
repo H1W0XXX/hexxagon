@@ -221,6 +221,136 @@ func FindBestMoveMCTS(rootBoard *Board, player CellState, sims int, timeBudget t
 	return best, true
 }
 
+// FindBestMoveMCTSWithVisits：带 root 访问计数分布的 MCTS（可选 NN 先验）
+// 返回：最佳走法、每个 9x9 格的访问次数（未在棋盘上的格子为 0）、是否成功找到走法
+func FindBestMoveMCTSWithVisits(rootBoard *Board, player CellState, sims int, timeBudget time.Duration, allowJump bool) (Move, []int, bool) {
+	if sims <= 0 && timeBudget <= 0 {
+		sims = 800
+	}
+	rand.Seed(time.Now().UnixNano())
+
+	aiCanJump := allowJump
+
+	root := newNode(rootBoard, player, nil, Move{}, player, aiCanJump)
+
+	// 根节点 NN 先验（softmax 概率）；失败则退化为均匀
+	rootPrior, _, err := PolicyValueNN(rootBoard, player)
+	if err != nil || len(rootPrior) != GridSize*GridSize {
+		rootPrior = nil
+	}
+
+	deadline := time.Now().Add(timeBudget)
+	for iter := 0; ; iter++ {
+		if sims > 0 && iter >= sims {
+			break
+		}
+		if timeBudget > 0 && time.Now().After(deadline) {
+			break
+		}
+
+		b := rootBoard.Clone()
+		cur := root
+		playerToMove := player
+		pathUndos := make([]undoInfo, 0, 128)
+
+		// Selection
+		for !cur.terminal && len(cur.unexpanded) == 0 && len(cur.children) > 0 {
+			mv, child := selectChild(cur, 1.4)
+			u := mMakeMoveWithUndo(b, mv, playerToMove)
+			pathUndos = append(pathUndos, u)
+			playerToMove = Opponent(playerToMove)
+			cur = child
+		}
+
+		// Expansion
+		if !cur.terminal && len(cur.unexpanded) > 0 {
+			last := len(cur.unexpanded) - 1
+			mv := cur.unexpanded[last]
+			cur.unexpanded = cur.unexpanded[:last]
+
+			u := mMakeMoveWithUndo(b, mv, playerToMove)
+			pathUndos = append(pathUndos, u)
+
+			child := newNode(b, Opponent(playerToMove), cur, mv, root.rootPlayer, root.aiCanJump)
+
+			// 设置先验：根节点用 NN，其他节点均匀
+			pr := 1.0
+			if cur.parent == nil && rootPrior != nil {
+				idx := AxialToIndex(mv.To)
+				if idx >= 0 && idx < len(rootPrior) {
+					pr = float64(rootPrior[idx]) + 1e-6
+				}
+			} else {
+				total := len(child.unexpanded) + len(child.children)
+				if total > 0 {
+					pr = 1.0 / float64(total)
+				}
+			}
+			child.prior = pr
+
+			cur.children[mv] = child
+			cur = child
+			playerToMove = Opponent(playerToMove)
+		}
+
+		// Evaluation：如果没有子则终局，否则用 NN value
+		var leafValue float64
+		if cur.terminal {
+			diff := b.CountPieces(root.rootPlayer) - b.CountPieces(Opponent(root.rootPlayer))
+			switch {
+			case diff > 0:
+				leafValue = 1.0
+			case diff < 0:
+				leafValue = -1.0
+			default:
+				leafValue = 0.0
+			}
+		} else {
+			vProb := float64(EvaluateNN3(b, playerToMove)) / 100.0 // 当前行棋方胜率
+			if playerToMove != root.rootPlayer {
+				vProb = 1.0 - vProb
+			}
+			leafValue = vProb*2 - 1 // 转到 rootPlayer 视角 [-1,1]
+		}
+
+		// Backup
+		for n := cur; n != nil; n = n.parent {
+			n.visits++
+			if n.playerToMove == root.rootPlayer {
+				n.valueSum += leafValue
+			} else {
+				n.valueSum -= leafValue
+			}
+		}
+
+		// 回溯棋盘
+		for i := len(pathUndos) - 1; i >= 0; i-- {
+			b.UnmakeMove(pathUndos[i])
+		}
+	}
+
+	if len(root.children) == 0 {
+		return Move{}, nil, false
+	}
+	var best Move
+	bestN := -1
+	for mv, ch := range root.children {
+		if ch.visits > bestN {
+			bestN = ch.visits
+			best = mv
+		}
+	}
+
+	visits := make([]int, GridSize*GridSize)
+	for mv, ch := range root.children {
+		idx := AxialToIndex(mv.To)
+		if idx >= 0 && idx < len(visits) {
+			visits[idx] = ch.visits
+		}
+	}
+	return best, visits, true
+}
+
 // 仅当 side==rootPlayer 且 aiCanJump==false 时，过滤掉跳越（保底：若没有克隆则不删）
 func filterMovesForSide(b *Board, side, rootPlayer CellState, aiCanJump bool, moves []Move) []Move {
 	if side != rootPlayer || aiCanJump {

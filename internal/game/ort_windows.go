@@ -23,6 +23,17 @@ var (
 
 func prepareORTSharedLib() (string, error) {
 	dllOnce.Do(func() {
+		// 0) 环境变量优先（允许手动指定 GPU 版 DLL）
+		if envPath := os.Getenv("ONNXRUNTIME_SHARED_LIBRARY_PATH"); envPath != "" {
+			if _, err := os.Stat(envPath); err == nil {
+				dllPath = envPath
+				return
+			} else {
+				dllErr = fmt.Errorf("ONNXRUNTIME_SHARED_LIBRARY_PATH=%s not found: %w", envPath, err)
+				return
+			}
+		}
+
 		exe, _ := os.Executable()
 		wd := filepath.Dir(exe) // 推荐放可执行文件同目录
 		p := filepath.Join(wd, "onnxruntime.dll")

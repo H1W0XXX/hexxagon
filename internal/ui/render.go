@@ -32,7 +32,7 @@ func Fragment(pos vec4, uv vec2, col vec4) vec4 {
 
 var gradShader *ebiten.Shader
 
-const tipSearchDepth = depth
+var TipSearchDepth = 1 // 默认为 1
 
 func init() {
 	s, err := ebiten.NewShader([]byte(gradKage))
@@ -375,37 +375,37 @@ func axialToScreen(c game.HexCoord,
 }
 
 func (gs *GameScreen) refreshMoveScores() {
+	if gs.ui.MoveScores == nil {
+		gs.ui.MoveScores = make(map[game.HexCoord]float64)
+	}
+	for k := range gs.ui.MoveScores {
+		delete(gs.ui.MoveScores, k)
+	}
+
+	// 1) 计算全局胜率 (始终转为玩家 A 视角)
+	_, score, err := game.KataPolicyValue(gs.state.Board, game.PlayerA)
+	if err == nil {
+		gs.ui.WinProbA = float64(score+1.0) / 2.0
+	}
+
 	if gs.selected == nil {
-		gs.ui = UIState{}
 		return
 	}
-	sel := *gs.selected
+
+	// 2) 选中棋子时，计算该动作下的 Policy 分布
 	player := gs.state.CurrentPlayer
-
-	gs.ui.From = &sel
-	gs.ui.MoveScores = make(map[game.HexCoord]float64)
-
-	moves := game.GenerateMoves(gs.state.Board, player)
-	for _, mv := range moves {
-		if mv.From != sel {
-			continue
+	selIdx := game.AxialToIndex(*gs.selected)
+	policy, _, err := game.KataPolicyValueWithSelection(gs.state.Board, player, selIdx)
+	if err == nil {
+		moves := game.GenerateMoves(gs.state.Board, player)
+		for _, mv := range moves {
+			if mv.From == *gs.selected {
+				targetIdx := game.AxialToIndex(mv.To)
+				if targetIdx >= 0 && targetIdx < len(policy) {
+					gs.ui.MoveScores[mv.To] = float64(policy[targetIdx] * 100.0)
+				}
+			}
 		}
-
-		bCopy := gs.state.Board.Clone()
-
-		// 关键：告诉评估"上一手就是这步"
-		bCopy.LastMove = mv
-
-		// 真正把这步下到 bCopy 上（会翻子）
-		if _, err := mv.Apply(bCopy, player); err != nil {
-			continue
-		}
-
-		// Use depth-4 AlphaBeta search (TT accelerated) for the score
-		// score := game.AlphaBetaNoTT(bCopy, player, 0)
-		score := game.AlphaBeta(bCopy, player, tipSearchDepth)
-
-		gs.ui.MoveScores[mv.To] = float64(score)
 	}
 }
 

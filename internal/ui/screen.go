@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+
 	"github.com/hajimehoshi/ebiten/v2/audio"
 	"github.com/hajimehoshi/ebiten/v2/text"
 	"golang.org/x/image/font/basicfont"
@@ -26,7 +27,6 @@ var lastUpdate time.Time
 
 var fontFace = basicfont.Face7x13
 
-const depth = 4 //人机思考步数
 const (
 	// 窗口尺寸
 	WindowWidth  = 800
@@ -56,6 +56,7 @@ type GameScreen struct {
 	offscreen       *ebiten.Image
 	anims           []*FrameAnim  // 正在播放的动画列表
 	aiEnabled       bool          // true=人机；false=人人
+	aiDepth         int           // 搜索深度
 	isAnimating     bool          // 标记是否正在播放动画
 	pendingClone    *pendingClone // 等待执行的 Clone 动作
 
@@ -123,12 +124,14 @@ type ReplayMatch struct {
 }
 
 // NewGameScreen 构造并初始化游戏界面
-func NewGameScreen(ctx *audio.Context, aiEnabled, showScores bool) (*GameScreen, error) {
+func NewGameScreen(ctx *audio.Context, aiEnabled bool, aiDepth int, showScores bool) (*GameScreen, error) {
 	var err error
+	TipSearchDepth = aiDepth // 同步提示功能使用的搜索深度
 	gs := &GameScreen{
 		state:       game.NewGameState(BoardRadius),
 		pieceImages: make(map[game.CellState]*ebiten.Image),
 		aiEnabled:   aiEnabled,
+		aiDepth:     aiDepth,
 		showScores:  showScores,
 		ui:          UIState{}, // 初始化 UIState
 		fontFace:    basicfont.Face7x13,
@@ -389,6 +392,10 @@ func (gs *GameScreen) Update() error {
 		}
 
 		gs.pendingCommit = nil
+		// 刷新胜率显示
+		if gs.showScores {
+			gs.refreshMoveScores()
+		}
 	}
 
 	// 5) 处理隐藏窗口（在pendingCommit之后）
@@ -450,7 +457,7 @@ func (gs *GameScreen) Update() error {
 			gs.aiCancelCh = make(chan struct{})
 			boardCopy := gs.state.Board.Clone()
 			allowJump := gs.aiJumpUnlocked
-			depthLim := depth
+			depthLim := gs.aiDepth
 
 			go func(b *game.Board, d int, allow bool, out chan<- game.Move, cancel <-chan struct{}) {
 				mv, _, ok := game.IterativeDeepening(b, game.PlayerB, d, allow)
@@ -545,23 +552,25 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 	// —— 新增：把评分画到每个目标格的中心 ——
 	if gs.showScores {
 		for to, score := range gs.ui.MoveScores {
-			// 1) 计算格子在 offscreen 上的像素中心（未缩放、未平移）
+			// 1) 计算格子在 offscreen 上的像素中心
 			cx := (float64(to.Q)+BoardRadius)*tileW*0.75 + tileW/2
 			cy := (float64(to.R)+BoardRadius+float64(to.Q)/2)*vs + tileH/2
 
-			// 2) 应用缩放和平移，得到最终绘制位置
 			px := originX + cx*boardScale
 			py := originY + cy*boardScale
 
-			// 3) 格式化分数，选颜色
-			str := fmt.Sprintf("%.1f", score)
-			clr := color.RGBA{0x20, 0xFF, 0x20, 0xFF} // 绿色
-			if score < 0 {
-				clr = color.RGBA{0xFF, 0x60, 0x60, 0xFF} // 负分红色
+			// 2) 格式化分数（百分比），数值越大颜色越亮
+			str := fmt.Sprintf("%.1f%%", score)
+			
+			// 根据概率调整亮度 (0-100 映射到 100-255)
+			brightness := uint8(100 + (score * 1.55))
+			clr := color.RGBA{0x20, brightness, 0x20, 0xFF} 
+			if score < 1.0 {
+				clr = color.RGBA{0x80, 0x80, 0x80, 0xFF} // 极低概率灰色
 			}
 
-			// 4) 画字（-10, +4 是为了让文本大致居中）
-			text.Draw(gs.offscreen, str, fontFace, int(px)-10, int(py)+4, clr)
+			// 3) 画字（居中）
+			drawTextCentered(gs.offscreen, str, px, py, clr)
 		}
 	}
 	//fmt.Println(gs.anims)
@@ -644,7 +653,12 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 	aCnt := gs.state.Board.CountPieces(game.PlayerA)
 	bCnt := gs.state.Board.CountPieces(game.PlayerB)
 
-	info := fmt.Sprintf("Red: %d     White: %d", aCnt, bCnt)
+	// 计算双方胜率展示 (统一基于玩家 A 视角)
+	probA := gs.ui.WinProbA
+	probB := 1.0 - probA
+
+	info := fmt.Sprintf("Red: %d (%.1f%%)     White: %d (%.1f%%)", 
+		aCnt, probA*100, bCnt, probB*100)
 	text.Draw(screen, info, gs.fontFace, 20, 24, color.White)
 }
 

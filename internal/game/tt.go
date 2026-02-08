@@ -32,6 +32,8 @@ type ttEntry struct {
 }
 
 var zobristSide [2]uint64
+var zobristStage [2]uint64               // stage 0/1
+var zobristSelected [BoardN]uint64       // 已选子（stage==1 时混入）
 var (
 	ttTable         = make([][ttWays]ttEntry, ttBuckets)
 	ttProbeCount    uint64
@@ -77,11 +79,28 @@ func initZobrist() {
 		// 3) Build side-to-move Zobrist keys
 		zobristSide[0] = rand.Uint64() // PlayerA to move
 		zobristSide[1] = rand.Uint64() // PlayerB to move
+		zobristStage[0] = 0
+		zobristStage[1] = rand.Uint64()
+		for i := 0; i < BoardN; i++ {
+			zobristSelected[i] = rand.Uint64()
+		}
 	})
 }
 
 func ttKeyFor(b *Board, current CellState) uint64 {
 	return b.hash ^ zobristSide[sideIdx(current)] ^ atomic.LoadUint64(&ttSalt)
+}
+
+// ttKeyForTwoPhase：包含 stage(0/1) 和已选子的 zobrist。
+func ttKeyForTwoPhase(b *Board, current CellState, stage int, selectedIdx int) uint64 {
+	key := b.hash ^ zobristSide[sideIdx(current)] ^ atomic.LoadUint64(&ttSalt)
+	if stage == 1 {
+		key ^= zobristStage[1]
+		if selectedIdx >= 0 && selectedIdx < BoardN {
+			key ^= zobristSelected[selectedIdx]
+		}
+	}
+	return key
 }
 
 func ClearTT() {

@@ -13,6 +13,7 @@ import (
 type UIState struct {
 	From       *game.HexCoord            // 当前选中的起点（nil 表示未选中）
 	MoveScores map[game.HexCoord]float64 // 起点到各个合法终点的评估分数
+	WinProbA   float64                   // 始终存储玩家 A (红色) 的胜率 [0, 1]
 }
 
 func getBoardTransform(tileImg *ebiten.Image) (scale, orgX, orgY, tileW, tileH, vs float64) {
@@ -109,27 +110,9 @@ func (gs *GameScreen) handleInput() {
 		if gs.state.Board.Cells[toIdx] == player { // 数组下标直读
 			gs.selected = &game.HexCoord{Q: coord.Q, R: coord.R}
 			gs.audioManager.Play("select_piece")
-			// === 评分提示（只算从该起点出的走法）===
-			gs.ui.From = gs.selected
-			gs.ui.MoveScores = make(map[game.HexCoord]float64)
-
-			moves := game.GenerateMoves(gs.state.Board, player)
-			for _, mv := range moves {
-				if mv.From != *gs.selected {
-					continue
-				}
-				bCopy := gs.state.Board.Clone()
-				bCopy.LastMove = mv
-				if _, err := mv.Apply(bCopy, player); err != nil {
-					continue
-				}
-				if gs.showScores {
-					score := game.Evaluate(bCopy, player)
-					gs.ui.MoveScores[mv.To] = float64(score)
-				}
+			if gs.showScores {
+				gs.refreshMoveScores()
 			}
-			// === end 评分提示 ===
-
 		} else {
 			gs.audioManager.Play("cancel_select_piece")
 		}
@@ -144,25 +127,27 @@ func (gs *GameScreen) handleInput() {
 		if gs.state.Board.Cells[toIdx] == player {
 			gs.selected = &game.HexCoord{Q: coord.Q, R: coord.R}
 			gs.audioManager.Play("select_piece")
-			gs.refreshMoveScores()
 		} else {
 			gs.selected = nil
 			gs.audioManager.Play("cancel_select_piece")
+		}
+		if gs.showScores {
+			gs.refreshMoveScores()
 		}
 		return
 	}
 
 	// 校验“合法步”：用邻接表判断是否 1 步(克隆) 或 2 步(跳跃)
-	fromIdx := game.IndexOf[*gs.selected] // 如果没导出，改用 indexOf[*gs.selected]
+	fromIdx := game.IndexOf[*gs.selected] 
 	valid := false
-	for _, nb := range game.NeighI[fromIdx] { // 如果没导出 neighI，就在同包内直接用
+	for _, nb := range game.NeighI[fromIdx] {
 		if nb == toIdx {
 			valid = true
 			break
 		}
 	}
 	if !valid {
-		for _, j := range game.JumpI[fromIdx] { // 如果没导出 jumpI，就在同包内用
+		for _, j := range game.JumpI[fromIdx] {
 			if j == toIdx {
 				valid = true
 				break
@@ -174,13 +159,12 @@ func (gs *GameScreen) handleInput() {
 		if gs.state.Board.Cells[toIdx] == player {
 			gs.selected = &game.HexCoord{Q: coord.Q, R: coord.R}
 			gs.audioManager.Play("select_piece")
-			if gs.showScores {
-				gs.refreshMoveScores()
-			}
-
 		} else {
 			gs.selected = nil
 			gs.audioManager.Play("cancel_select_piece")
+		}
+		if gs.showScores {
+			gs.refreshMoveScores()
 		}
 		return
 	}
@@ -199,10 +183,8 @@ func (gs *GameScreen) handleInput() {
 		// 成功：设置 AI 延迟并清空选中
 		gs.aiDelayUntil = time.Now().Add(total)
 		gs.selected = nil
-
 	}
 	if gs.showScores {
 		gs.refreshMoveScores()
 	}
-
 }

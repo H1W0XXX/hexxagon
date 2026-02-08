@@ -155,8 +155,36 @@ func EvaluateBitBoard(b *Board, player CellState) int {
 	return pieceScore + edgeScore + triangleScore
 }
 
-// ---- 兼容旧入口：直接走位板版 ----
+// 控制每个执子方是否使用 ONNX 评估（默认开启 PlayerB 以供人机模式使用）。
+var (
+	UseONNXForPlayerA = false
+	UseONNXForPlayerB = true
+)
 
 func Evaluate(b *Board, player CellState) int {
+	return EvaluateBitBoard(b, player)
+}
+
+// EvaluateNN 强制使用神经网络评估
+func EvaluateNN(b *Board, player CellState) int {
+	if v, err := KataValueScore(b, player); err == nil {
+		return v
+	}
+	return EvaluateBitBoard(b, player)
+}
+
+// HybridEvaluate 根据剩余深度决定是否使用 NN。
+// 深度较大时（如 >= 0，即所有递归出口）使用 NN 获得高质量评估。
+// 如果想彻底提速，可以改为 depth >= 1。
+func HybridEvaluate(b *Board, player CellState, depth int64) int {
+	// 总是尝试 NN，如果失败会回退静态
+	return EvaluateNN(b, player)
+}
+
+// EvaluateWithSelection：可选传入“已选子”网格索引；主要用于根层启发式排序。
+func EvaluateWithSelection(b *Board, player CellState, selectedIdx int) int {
+	if v, err := KataValueScoreWithSelection(b, player, selectedIdx); err == nil {
+		return v
+	}
 	return EvaluateBitBoard(b, player)
 }

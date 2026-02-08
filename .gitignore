@@ -1,38 +1,51 @@
-# 忽略所有平台的构建产物
+# Binaries and Build Artifacts
 *.exe
+*.exe~
+*.dll
+*.so
+*.dylib
 *.zip
+hexxagon-darwin-arm64
+bin/
 
-# 忽略 Go 缓存文件
-*.out
-
-# 忽略 IDEA 的项目配置文件
-.idea/
+# Neural Network Models and Large Data
+*.onnx
+*.onnx.gz
+*.onnx_
+*.pt
+*.pt_
+*.ckpt
+*.go_
 AIdata/
+selfplayData/
+training/
+sql_cache_npy.tar.gz
 
+# Assets directory large files
+internal/game/assets/*.onnx*
+internal/game/assets/*.pt*
+internal/game/assets/*.ckpt
+internal/game/assets/*.dll
+internal/game/assets/*.so
+internal/game/assets/*.dylib
+
+# Project Specific
+.idea/
 素材/
-# 忽略系统文件
+KataGomo-Hexxagon/
+web/
+blender/
+
+# Logs and Temp files
+*.log
+*.out
+*.ps1
+*.py
+*.csv
+*.json
+*.txt
 .DS_Store
 Thumbs.db
 
-# 忽略其他临时文件
-*.log
-*.ps1
-
-*.py
-
-selfplayData/
-*.csv
-*.json
-*.gz
-selfplay
-*.txt
-*.dll
-*.dylib
-*.onnx
-*.pt
-*.so
-
-cmd/selfplay
-hexxagon-darwin-arm64
-
-*.go_
+# Go specific
+go.sum

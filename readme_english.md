@@ -1,66 +1,51 @@
-# Hexxagon Go
+# Hexxagon Go (NN Edition)
 
-Hexxagon Go is a board game implementation of **Hexxagon** written in Go. It includes full game rules, a graphical user interface, sound effects, and multiple AI strategies.
+Hexxagon Go is a high-performance implementation of the **Hexxagon** board game developed in Go. This project has transitioned from traditional static evaluation to a deep learning-based **Neural Network (NN)** engine, delivering a professional-level AI experience.
 
 ## 🎮 Game Overview
 
-The Hexxagon board is a hexagonal grid with a radius of 4. The goal is to occupy more cells than your opponent before the board is filled or one side has no legal moves left.
+Hexxagon is a strategic game played on a 61-cell (radius 4) hexagonal grid. Players move pieces via "cloning" or "jumping" to expand territory and infect opponent pieces. The goal is to control the majority of the board when no legal moves remain.
 
-## 🧩 Board Elements
+## 🧠 Neural Network AI Features
 
-* **Empty Cell**: Normal position where pieces can be placed or moved through.
-* **Obstacle**: Unusable cell; no piece can move into it.
-* **Red/White Pieces**: Current positions of the two players.
-
-## ➡️ Movement Rules
-
-On a player's turn, they may choose one of their pieces and perform one of two moves:
-
-1. **Clone Move**: Move to an adjacent cell (distance 1). The original piece stays, and a new piece is created in the destination.
-2. **Jump Move**: Jump over one cell to a position at distance 2. The original cell becomes empty.
-
-## 🔄 Infection Mechanism
-
-After either a clone or jump move, all adjacent enemy pieces around the destination cell are immediately "infected" and converted to the moving player’s color.
-
-## 🏁 Win Condition
-
-* The game ends when the board is full or one side has no legal moves.
-* The player with more pieces on the board wins.
+The project integrates an advanced neural network evaluation system:
+- **Architecture**: Based on KataGo V7, supporting 22 spatial feature planes and 19 global features.
+- **Training**: Trained using Reinforcement Learning through [KataGomo-Hexxagon](https://github.com/hzyhhzy/KataGomo/tree/Hexxagon).
+- **Inference Optimization**: Powered by ONNX Runtime with **CUDA GPU acceleration**. It utilizes **Batch Inference** technology to evaluate dozens of moves simultaneously, drastically increasing search efficiency.
+- **Hybrid Search**: Combines Alpha-Beta pruning with high-precision neural network scoring to achieve superhuman playing strength.
 
 ## 🚀 Quick Start
 
-```bash
-# Human vs AI (default mode)
-./hexxagon
+### Environment
+- **Windows (Recommended)**: Supports CUDA acceleration out of the box (requires proper drivers and DLLs).
+- **macOS/Linux**: Automatically falls back to optimized CPU inference.
 
-# Human vs AI with score hints (depth 4)
-./hexxagon --tip=true
+### Launch Commands
+```powershell
+# Human vs AI (Default depth 1; NN depth 1 or 2 is recommended)
+./hexxagon.exe -depth 1
 
-# Two-player mode
-./hexxagon --mode=pvp
+# Professional Analysis Mode (Displays policy percentages & real-time win probability)
+./hexxagon.exe -depth 1 -tip
+
+# Two-player Mode
+./hexxagon.exe -mode pvp
 ```
 
-## 🤖 AI Implementation
+## 📊 Professional UI Analysis (`-tip` flag)
 
-* Search uses iterative deepening with root-level parallelization, ordering legal moves by heuristic score.
-* Static evaluation (`internal/game/evaluate.go`) considers piece count, edge control, triangle formations, and applies dynamic weighting based on game state.
-* Each recursive layer applies Alpha-Beta pruning with a transposition table (`tt.go`) to cache results and reduce branching.
-* Additional pruning rules include strategic filtering, risky jump avoidance, and infection count estimation to stabilize move selection.
-* When the `-tip` flag is enabled, the UI runs a depth-4 search on candidate moves to provide real-time score hints to the player.
+When enabled, the UI provides real-time neural network insights:
+- **Live Win Probability**: Displays the win percentage for both players in the top-left corner.
+- **Move Policy Hints**: When a piece is selected, each legal destination shows its **Policy probability percentage**.
+- **Heatmap Display**: Text brightness dynamically adjusts based on probability—higher chances appear brighter/stronger, helping you identify the best tactical moves instantly.
 
-## 🧠 CNN Model Training
+## 🧮 Performance Optimizations
 
-* Training data is generated from self-play matches.
-* Training code is based on PyTorch with DDP and AMP, using a deep CNN on the 81-cell board with 6 rotation/mirror augmentations (12× expansion). Multi-GPU is supported.
-* The trained model is saved as `hex_cnn.pt`, then converted via `export_hex_cnn_to_onnx.py` into `assets/hex_cnn.onnx` for in-game inference (`internal/ml/onnx_infer.go`).
-
-## 🧮 Inference Backends
-
-* **GPU Inference (Windows/CUDA)**: Place `onnxruntime_providers_cuda.dll`, `onnxruntime_providers_tensorrt.dll`, `cudnn*_9.dll`, etc. in the same directory as the executable, and set `ONNXRUNTIME_SHARED_LIBRARY_PATH` to point to the GPU version of `onnxruntime.dll`.
-* **CPU Inference**: If CUDA dependencies are missing or on non-Windows OS, the program automatically falls back to CPU inference, extracting CPU runtime DLLs automatically with no additional setup.
+- **Model Compression**: Supports `.onnx.gz` format to reduce executable size while maintaining fast load times.
+- **Batch Evaluation**: Employs Batch Inference at the root and shallow tree levels to maximize GPU throughput.
+- **Efficient Encoding**: Bitboard-driven move generation paired with precise neural network intuition.
 
 ## 📜 License
 
-* Free to use for learning, research, and non-commercial purposes. Attribution to the repository link and author is required.
-* Commercial use is strictly prohibited, including redistribution, paid distribution, or embedding in paid services.
+- This project is free for learning, research, and non-commercial purposes. Please attribute the repository link and author information when used.
+- **Commercial use is strictly prohibited** (including but not limited to redistribution for profit, paid distribution, or embedding in paid services).

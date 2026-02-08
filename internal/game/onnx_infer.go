@@ -2,15 +2,13 @@
 package game
 
 import (
-	_ "embed"
+	"embed"
+	"fmt"
 	"log"
 	"math"
-	"runtime"
-
-	//"errors"
-	"fmt"
 	"os"
-	//"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	ort "github.com/yalue/onnxruntime_go"
@@ -18,8 +16,8 @@ import (
 
 // —— 把 ONNX 模型打进二进制 ——
 //
-//go:embed assets/hex_cnn.onnx
-var onnxBytes []byte
+//go:embed assets/*.onnx.gz
+var embeddedFS embed.FS
 
 // 如果你的导出脚本用了别的输入/输出名，请改这里：
 // 训练脚本里通常是 input_names=["state"], output_names=["policy","value"]
@@ -34,20 +32,52 @@ const (
 )
 
 var (
-	ortOnce  sync.Once
-	ortErr   error
-	ortSess  *ort.AdvancedSession
-	ortMu    sync.Mutex // AdvancedSession 里绑定了固定的张量，这里串行化 Run，先稳妥跑通
-	inTensor *ort.Tensor[float32]
-	outP     *ort.Tensor[float32]
-	outV     *ort.Tensor[float32]
-	tmpModel string
+	ortOnce       sync.Once
+	ortErr        error
+	ortSess       *ort.AdvancedSession
+	ortMu         sync.Mutex // AdvancedSession 里绑定了固定的张量，这里串行化 Run，先稳妥跑通
+	inTensor      *ort.Tensor[float32]
+	outP          *ort.Tensor[float32]
+	outV          *ort.Tensor[float32]
+	tmpModel      string
+	externalModel []byte
 )
 
 // 初始化 ONNX Runtime & 会话
 func ensureONNX() error {
 	//log.Printf("[ensureONNX] invoked")
 	ortOnce.Do(func() {
+		// 0) 外部模型路径优先：设置 HEX_ONNX_PATH 指定
+		if path := os.Getenv("HEX_ONNX_PATH"); path != "" {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				ortErr = fmt.Errorf("read HEX_ONNX_PATH %s: %w", path, err)
+				return
+			}
+			externalModel = b
+			log.Printf("[ensureONNX] using external ONNX: %s", path)
+		} else {
+			// 尝试从 embed 的 assets 目录找任意 .onnx
+			entries, err := embeddedFS.ReadDir("assets")
+			if err == nil {
+				for _, e := range entries {
+					if e.IsDir() {
+						continue
+					}
+					if strings.HasSuffix(strings.ToLower(e.Name()), ".onnx") {
+						b, rerr := embeddedFS.ReadFile("assets/" + e.Name())
+						if rerr == nil {
+							externalModel = b
+							log.Printf("[ensureONNX] using embedded ONNX: assets/%s", e.Name())
+							break
+						}
+						ortErr = fmt.Errorf("read embedded assets/%s: %w", e.Name(), rerr)
+						return
+					}
+				}
+			}
+		}
+
 		// 1) 准备并加载 ORT 动态库（平台函数 prepareORTSharedLib/ensureDLLInCWD）
 		libPath, err := prepareORTSharedLib()
 		if err != nil {
@@ -65,13 +95,13 @@ func ensureONNX() error {
 		}
 		log.Printf("[ensureONNX] InitializeEnvironment succeeded")
 
-		// 3) 模型字节自检
-		if len(onnxBytes) == 0 {
-			ortErr = fmt.Errorf("empty onnxBytes (embedded model missing)")
+		// 3) 模型字节自检（外部优先，否则 embed）
+		modelBytes := externalModel
+		if len(modelBytes) == 0 {
+			ortErr = fmt.Errorf("no ONNX model: set HEX_ONNX_PATH or place any .onnx under internal/game/assets")
 			return
 		}
-		// 正确接收 3 个返回值：inputs, outputs, err
-		inputs, outputs, gierr := ort.GetInputOutputInfoWithONNXData(onnxBytes)
+		inputs, outputs, gierr := ort.GetInputOutputInfoWithONNXData(modelBytes)
 		if gierr != nil {
 			ortErr = fmt.Errorf("GetInputOutputInfoWithONNXData: %w", gierr)
 			return
@@ -125,7 +155,7 @@ func ensureONNX() error {
 		}
 
 		ortSess, e = ort.NewAdvancedSessionWithONNXData(
-			onnxBytes,
+			modelBytes,
 			[]string{onnxInputName},
 			[]string{onnxPolicyName, onnxValueName},
 			[]ort.Value{inTensor},
@@ -214,7 +244,7 @@ func encodeBoard(b *Board, me CellState, dst []float32) {
 //	return int(v * 100.0)
 //}
 
-func EvaluateNN(b *Board, me CellState) int {
+func EvaluateNN3(b *Board, me CellState) int {
 	if err := ensureONNX(); err != nil {
 		// 回退到旧静态评估
 		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
@@ -238,28 +268,6 @@ func EvaluateNN(b *Board, me CellState) int {
 	// 将概率放大为整数，方便评估
 	return int(vProb * 100.0)
 }
-
-// 可选：拿策略头（81 logits，自己在 Go 侧做 mask/softmax/挑选）
-//func PolicyNN(b *Board, me CellState) ([]float32, error) {
-//	if err := ensureONNX(); err != nil {
-//		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
-//		return nil, err
-//	}
-//	// 输入
-//	data := inTensor.GetData()
-//	encodeBoard(b, me, data)
-//
-//	ortMu.Lock()
-//	err := ortSess.Run()
-//	ortMu.Unlock()
-//	if err != nil {
-//		return nil, err
-//	}
-//	logits := make([]float32, policyOutDim)
-//	copy(logits, outP.GetData())
-//	// 这里不做 softmax；若需要概率，再减去 max 然后做 exp/sum
-//	return logits, nil
-//}
 
 func PolicyNN(b *Board, me CellState) ([]float32, error) {
 	if err := ensureONNX(); err != nil {
@@ -295,6 +303,51 @@ func PolicyNN(b *Board, me CellState) ([]float32, error) {
 	// softmax 数组包含每个动作的概率
 
 	return softmax, nil
+}
+
+// PolicyValueNN：一次前向同时取 policy 概率与 value 概率
+// policy 是 81 维 softmax，valueProb 为当前执子方获胜概率 [0,1]
+func PolicyValueNN(b *Board, me CellState) ([]float32, float32, error) {
+	if err := ensureONNX(); err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to init ONNX:", err)
+		return nil, 0, err
+	}
+	// 输入
+	data := inTensor.GetData()
+	encodeBoard(b, me, data)
+
+	// 跑一次
+	ortMu.Lock()
+	err := ortSess.Run()
+	ortMu.Unlock()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// policy softmax
+	logits := make([]float32, policyOutDim)
+	copy(logits, outP.GetData())
+	expSum := float32(0)
+	for _, l := range logits {
+		expSum += float32(math.Exp(float64(l)))
+	}
+	policy := make([]float32, len(logits))
+	if expSum == 0 {
+		uni := 1.0 / float32(len(logits))
+		for i := range policy {
+			policy[i] = uni
+		}
+	} else {
+		for i, l := range logits {
+			policy[i] = float32(math.Exp(float64(l))) / expSum
+		}
+	}
+
+	// value：logit -> prob
+	vLogit := outV.GetData()[0]
+	vProb := float32(1.0 / (1.0 + math.Exp(float64(-vLogit))))
+
+	return policy, vProb, nil
 }
 
 // —— 小工具 ——

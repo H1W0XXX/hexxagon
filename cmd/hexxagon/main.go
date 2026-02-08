@@ -6,7 +6,6 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/audio"
 	"hexxagon_go/internal/ui"
 	"log"
-	"strconv"
 )
 
 //import _ "net/http/pprof"
@@ -46,21 +45,21 @@ func main() {
 
 	// —— 新增：启动参数 —— //
 	modeFlag := flag.String("mode", "pve", "游戏模式: pve(人机) 或 pvp(人人)")
-	scoreTipFlag := flag.String("tip", "false", "是否展示玩家棋子评分(true/false)")
+	depthFlag := flag.Int("depth", 1, "人机搜索深度 (ONNX 建议 1 或 2)")
+	// 支持 -tip / -tips 两个别名
+	showScoresFlag := flag.Bool("tip", false, "是否展示玩家棋子评分")
+	flag.BoolVar(showScoresFlag, "tips", false, "是否展示玩家棋子评分 (同 -tip)")
 	flag.Parse()
 	aiEnabled := (*modeFlag == "pve") // pve=启用 AI，pvp=禁用 AI
-	// 把 string 转成 bool
-	showScores, err := strconv.ParseBool(*scoreTipFlag)
-	if err != nil {
-		log.Fatalf("无效的 -tip 参数 %q: %v", *scoreTipFlag, err)
-	}
+	aiDepth := *depthFlag
+	showScores := *showScoresFlag
 
 	ctx := audio.NewContext(sampleRate)
 	if ctx == nil {
 		log.Fatal("audio context not initialized")
 	}
 
-	screen, err := ui.NewGameScreen(ctx, aiEnabled, showScores) // 传入 AI 开关
+	screen, err := ui.NewGameScreen(ctx, aiEnabled, aiDepth, showScores) // 传入 AI 开关和深度
 	if err != nil {
 		log.Fatal(err)
 	}

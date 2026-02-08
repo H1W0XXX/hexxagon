@@ -17,7 +17,7 @@ var (
 
 // 在 initBoardTables() 之后调用一次
 func initEncodeTables() {
-	// 1) 9×9 网格 → 轴坐标，并标注是否在半径3棋盘内
+	// 1) 9×9 网格 → 轴坐标，并标注是否在半径4棋盘内
 	idx := 0
 	for y := 0; y < GridSize; y++ {
 		for x := 0; x < GridSize; x++ {
@@ -25,15 +25,15 @@ func initEncodeTables() {
 			r := y - 4
 			c := HexCoord{Q: q, R: r}
 			gridAxial[idx] = c
-			// 是否在 radius=3 的六角内
-			in := abs(q)+abs(r)+abs(-q-r) <= 2*boardRadius // boardRadius=3
+			// 边长为5，意味着半径为4。判断标准：|q|<=4, |r|<=4, |q+r|<=4
+			in := abs(q) <= 4 && abs(r) <= 4 && abs(-q-r) <= 4
 			gridInBoard[idx] = in
 			idx++
 		}
 	}
 	// 2) 棋盘下标 -> 网格下标
 	for i := 0; i < BoardN; i++ {
-		c := CoordOf[i] // 由 initBoardTables() 填好
+		c := CoordOf[i] 
 		x := c.Q + 4
 		r := c.R + 4
 		g := r*GridSize + x

@@ -8,6 +8,8 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	// TODO: 把这个路径改成你项目里 game 包的真实模块路径
@@ -133,21 +135,30 @@ func writeCSV(path string, rows [][]string) error {
 }
 
 func main() {
+	// 信号监听，按下 Ctrl+C 强制退出
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Printf("\n[系统] 接收到退出信号，正在强制停止...\n")
+		os.Exit(0)
+	}()
+
 	rand.Seed(time.Now().UnixNano())
 
 	var (
-		games     = flag.Int("games", 200, "对战总局数")
+		games     = flag.Int("games", 100, "对战总局数")
 		radius    = flag.Int("radius", 4, "棋盘半径（4=9x9）")
-		depthA    = flag.Int("depth_hybrid", 3, "Hybrid 搜索深度")
+		depthA    = flag.Int("depth_hybrid", 2, "Hybrid 搜索深度")
 		depthB    = flag.Int("depth_base", 3, "Base 搜索深度")
 		allowJump = flag.Bool("allow_jump", true, "是否允许跳跃（传给AI层的门控）")
 		outCSV    = flag.String("out", "hybrid_vs_base_samples.csv", "采样CSV输出路径")
 	)
 	flag.Parse()
 
-	// 绑定两种搜索
-	fnHybrid := game.FindBestMoveAtDepthHybrid
-	fnBase := game.FindBestMoveAtDepth
+	// 绑定搜索：统一用当前 αβ 实现，区别在于 Evaluate 是否启用 ONNX。
+	// 我们通过切换 UseONNXForPlayerA/B 来实现“ONNX vs 旧评估”。
+	fnSearch := game.FindBestMoveAtDepth
 
 	aWins, bWins, draws := 0, 0, 0
 	rows := [][]string{{"game", "ply", "empties", "piece_diff", "mover_ai"}} // mover_ai: 执棋方标签（Hybrid/Base）
@@ -155,7 +166,18 @@ func main() {
 	for g := 1; g <= *games; g++ {
 		aFirst := (g%2 == 1) // 奇数局 Hybrid 先，偶数局 Base 先
 
-		w, frames := playOneGame(*radius, aFirst, int64(*depthA), int64(*depthB), *allowJump, fnHybrid, fnBase)
+		// 根据先后手切换 ONNX 使用方：
+		// aFirst=true  -> PlayerA(先手)=Hybrid(ONNX)，PlayerB=Base(旧评估)
+		// aFirst=false -> PlayerA=Base，PlayerB=Hybrid(ONNX)
+		if aFirst {
+			game.UseONNXForPlayerA = true
+			game.UseONNXForPlayerB = false
+		} else {
+			game.UseONNXForPlayerA = false
+			game.UseONNXForPlayerB = true
+		}
+
+		w, frames := playOneGame(*radius, aFirst, int64(*depthA), int64(*depthB), *allowJump, fnSearch, fnSearch)
 
 		switch w {
 		case +1: // A 赢
@@ -199,5 +221,3 @@ func main() {
 	}
 	fmt.Printf("采样已写入: %s（列: game, ply, empties, piece_diff, mover_ai）\n", *outCSV)
 }
-
-// go build -o hybrid_vs_base.exe .\cmd\battle_eval_nn\main.go

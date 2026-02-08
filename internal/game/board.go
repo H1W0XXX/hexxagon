@@ -142,12 +142,11 @@ func (b *Board) set(c HexCoord, s CellState) {
 // NewBoard creates and initializes a new board with the given radius.
 func NewBoard(radius int) *Board {
 	if radius != boardRadius {
-		panic("NewBoard: radius must be 3")
+		panic("NewBoard: radius must match boardRadius (4)")
 	}
 	b := &Board{radius: radius}
 	for i := 0; i < BoardN; i++ {
 		b.Cells[i] = Empty
-		// hash = 0（Empty 的 zob 不需要异或）
 	}
 	return b
 }
@@ -297,7 +296,7 @@ func (b *Board) Hash() uint64 {
 // CountPieces 统计棋盘上 pl 方棋子数量
 func (b *Board) CountPieces(pl CellState) int {
 	n := 0
-	for i := 0; i < BoardN; i++ { // boardN = 37
+	for i := 0; i < BoardN; i++ { 
 		if b.Cells[i] == pl {
 			n++
 		}
