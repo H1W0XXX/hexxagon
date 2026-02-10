@@ -383,9 +383,9 @@ func (gs *GameScreen) refreshMoveScores() {
 	}
 
 	// 1) 计算全局胜率 (始终转为玩家 A 视角)
-	_, score, err := game.KataPolicyValue(gs.state.Board, game.PlayerA)
+	winProb, err := game.KataWinProb(gs.state.Board, game.PlayerA)
 	if err == nil {
-		gs.ui.WinProbA = float64(score+1.0) / 2.0
+		gs.ui.WinProbA = float64(winProb)
 	}
 
 	if gs.selected == nil {

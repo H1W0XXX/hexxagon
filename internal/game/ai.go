@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -61,11 +62,23 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 
 	useNN := (player == PlayerA && UseONNXForPlayerA) || (player == PlayerB && UseONNXForPlayerB)
 
+	// 计算并行度：核心数/8，向上取偶数，范围 [2, 8]
+	numWorkers := (runtime.NumCPU() + 7) / 8
+	if numWorkers%2 != 0 {
+		numWorkers++
+	}
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
+	if numWorkers > 8 {
+		numWorkers = 8
+	}
+
 	type scored struct {
 		mv    Move
 		score int
 	}
-	results := make([]scored, 0, len(moves))
+	results := make([]scored, len(moves))
 
 	// 特殊优化：如果深度为 1 且启用 NN，直接使用批量推理
 	if depth == 1 && useNN {
@@ -75,72 +88,80 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 			nb.ApplyMove(mv, player)
 			batchBoards[i] = nb
 		}
-		// 关键修复：落子后的局面轮到对手走，所以以 Opponent 视角评估并取反
 		opp := Opponent(player)
 		scores, err := KataBatchValueScore(batchBoards, opp)
 		if err == nil {
 			for i, s := range scores {
-				results = append(results, scored{mv: moves[i], score: -s})
+				results[i] = scored{mv: moves[i], score: -s}
 			}
-		} else {
-			// 失败回退
-			for _, mv := range moves {
-				undo := mMakeMoveWithUndo(b, mv, player)
-				statScore := hybridAlphaBeta(b, 0, Opponent(player), player, depth-1, -1000000, 1000000, allowJump)
-				b.UnmakeMove(undo)
-				results = append(results, scored{mv: mv, score: statScore})
-			}
-		}
-	} else {
-		// 标准搜索流程（深度 >= 2 或非 NN）
-		if useNN {
-			// 在根节点进行高质量批量排序
-			batchBoards := make([]*Board, len(moves))
-			selectedIndices := make([]int, len(moves))
-			for i, mv := range moves {
-				batchBoards[i] = b
-				selectedIndices[i] = boardIndexToGrid[IndexOf[mv.To]]
-			}
-			scores, err := KataBatchValueScoreWithSelection(batchBoards, player, selectedIndices)
-			if err == nil {
-				type moveWithScore struct {
-					mv    Move
-					score int
-				}
-				mvs := make([]moveWithScore, len(moves))
-				for i := range moves {
-					mvs[i] = moveWithScore{moves[i], scores[i]}
-				}
-				sort.Slice(mvs, func(i, j int) bool { return mvs[i].score > mvs[j].score })
-				for i := range moves {
-					moves[i] = mvs[i].mv
-				}
-			}
-		} else {
-			// 非 NN 玩家使用简单排序
-			sort.Slice(moves, func(i, j int) bool {
-				return previewInfectedCount(b, moves[i], player) > previewInfectedCount(b, moves[j], player)
-			})
-		}
-
-		alpha := -1000000
-		beta := 1000000
-
-		for _, mv := range moves {
-			undo := mMakeMoveWithUndo(b, mv, player)
-			statScore := hybridAlphaBeta(b, 0, Opponent(player), player, depth-1, alpha, beta, allowJump)
-			b.UnmakeMove(undo)
-
-			if statScore > alpha {
-				alpha = statScore
-			}
-			results = append(results, scored{mv: mv, score: statScore})
+			sort.Slice(results, func(i, j int) bool { return results[i].score > results[j].score })
+			return results[0].mv, true
 		}
 	}
 
+	// 任务分发管道
+	type task struct {
+		idx int
+		mv  Move
+	}
+	taskChan := make(chan task, len(moves))
+
+	// 启发式排序：提升剪枝效率
+	if useNN {
+		batchBoards := make([]*Board, len(moves))
+		selectedIndices := make([]int, len(moves))
+		for i, mv := range moves {
+			batchBoards[i] = b
+			selectedIndices[i] = boardIndexToGrid[IndexOf[mv.To]]
+		}
+		scores, err := KataBatchValueScoreWithSelection(batchBoards, player, selectedIndices)
+		if err == nil {
+			type moveWithScore struct {
+				mv    Move
+				score int
+			}
+			mvs := make([]moveWithScore, len(moves))
+			for i := range moves {
+				mvs[i] = moveWithScore{moves[i], scores[i]}
+			}
+			sort.Slice(mvs, func(i, j int) bool { return mvs[i].score > mvs[j].score })
+			for i, it := range mvs {
+				taskChan <- task{i, it.mv}
+			}
+		} else {
+			for i, mv := range moves {
+				taskChan <- task{i, mv}
+			}
+		}
+	} else {
+		sort.Slice(moves, func(i, j int) bool {
+			return previewInfectedCount(b, moves[i], player) > previewInfectedCount(b, moves[j], player)
+		})
+		for i, mv := range moves {
+			taskChan <- task{i, mv}
+		}
+	}
+	close(taskChan)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localBoard := b.Clone() // 每个线程私有 Board
+			for t := range taskChan {
+				undo := mMakeMoveWithUndo(localBoard, t.mv, player)
+				// 初始 alpha/beta 窗口
+				score := hybridAlphaBeta(localBoard, 0, Opponent(player), player, depth-1, -1000000, 1000000, allowJump)
+				localBoard.UnmakeMove(undo)
+				results[t.idx] = scored{mv: t.mv, score: score}
+			}
+		}()
+	}
+	wg.Wait()
+
 	sort.Slice(results, func(i, j int) bool { return results[i].score > results[j].score })
 
-	// 如果是 NN 玩家，始终选第一名以展示真实实力
 	if useNN {
 		return results[0].mv, true
 	}
@@ -155,6 +176,7 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 	pick := rand.Intn(topK)
 	return results[pick].mv, true
 }
+
 
 func hybridAlphaBeta(
 	b *Board,

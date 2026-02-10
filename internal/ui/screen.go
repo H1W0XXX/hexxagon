@@ -657,9 +657,23 @@ func (gs *GameScreen) Draw(screen *ebiten.Image) {
 	probA := gs.ui.WinProbA
 	probB := 1.0 - probA
 
-	info := fmt.Sprintf("Red: %d (%.1f%%)     White: %d (%.1f%%)", 
-		aCnt, probA*100, bCnt, probB*100)
-	text.Draw(screen, info, gs.fontFace, 20, 24, color.White)
+	redColor := color.RGBA{255, 120, 120, 255} // 柔和的红色
+	whiteColor := color.White
+
+	var redInfo, whiteInfo string
+	if gs.showScores {
+		redInfo = fmt.Sprintf("Red: %d (%.1f%%)", aCnt, probA*100)
+		whiteInfo = fmt.Sprintf("White: %d (%.1f%%)", bCnt, probB*100)
+	} else {
+		redInfo = fmt.Sprintf("Red: %d", aCnt)
+		whiteInfo = fmt.Sprintf("White: %d", bCnt)
+	}
+
+	// 分两次绘制，计算间距
+	text.Draw(screen, redInfo, gs.fontFace, 20, 24, redColor)
+	// 粗略计算红色文本宽度来决定白色文本的起点 (每个字符约 7 像素)
+	whiteX := 20 + len(redInfo)*7 + 30
+	text.Draw(screen, whiteInfo, gs.fontFace, whiteX, 24, whiteColor)
 }
 
 // Layout 定义窗口尺寸
