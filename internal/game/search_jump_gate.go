@@ -4,15 +4,18 @@ func filterJumpsByFlag(b *Board, side CellState, moves []Move, allowJump bool) [
 	if allowJump {
 		return moves
 	}
-	keep := make([]Move, 0, len(moves))
-	for _, m := range moves {
+	n := 0
+	originalCount := len(moves)
+	for i := 0; i < originalCount; i++ {
+		m := moves[i]
 		if m.IsClone() {
-			keep = append(keep, m)
+			moves[n] = m
+			n++
 		}
 	}
-	if len(keep) > 0 {
-		return keep
+	if n > 0 {
+		return moves[:n]
 	}
 	// 极端局面只有跳越可走时，兜底不拦（否则会卡死）
-	return moves
+	return moves[:originalCount]
 }

@@ -18,6 +18,7 @@ bin/
 *.go_
 AIdata/
 selfplayData/
+trt_cache/
 training/
 sql_cache_npy.tar.gz
 

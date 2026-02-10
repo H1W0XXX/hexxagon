@@ -1,6 +1,9 @@
 package game
 
-import "fmt"
+import (
+	"fmt"
+	"math/bits"
+)
 
 // Move 表示一次从 From 到 To 的走子
 type Move struct {
@@ -85,16 +88,29 @@ func (m Move) IsJumpOld() bool {
 func GenerateMoves(b *Board, player CellState) []Move {
 	moves := make([]Move, 0, 64) // 预分配
 
-	for i := 0; i < BoardN; i++ {
-		if b.Cells[i] != player {
-			continue
-		}
+	// 获取当前玩家的棋子位掩码
+	var pBit uint64
+	if player == PlayerA {
+		pBit = b.bitA
+	} else if player == PlayerB {
+		pBit = b.bitB
+	} else {
+		return nil
+	}
+
+	// 使用 TrailingZeros64 快速遍历位掩码中为 1 的位（棋子下标）
+	for pBit != 0 {
+		i := bits.TrailingZeros64(pBit)
+		// 清除最低位的 1
+		pBit &= ^(uint64(1) << uint(i))
+
+		fromCoord := CoordOf[i]
 
 		// 克隆（距离=1）
 		for _, to := range NeighI[i] {
 			if b.Cells[to] == Empty {
 				moves = append(moves, Move{
-					From: CoordOf[i],
+					From: fromCoord,
 					To:   CoordOf[to],
 				})
 			}
@@ -104,7 +120,7 @@ func GenerateMoves(b *Board, player CellState) []Move {
 		for _, to := range JumpI[i] {
 			if b.Cells[to] == Empty {
 				moves = append(moves, Move{
-					From: CoordOf[i],
+					From: fromCoord,
 					To:   CoordOf[to],
 				})
 			}

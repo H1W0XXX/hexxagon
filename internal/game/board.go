@@ -35,17 +35,19 @@ type Board struct {
 	radius     int
 	Cells      [BoardN]CellState // 定长数组
 	hash       uint64
+	bitA, bitB uint64 // 新增：位掩码，加速评估
 	LastMove   Move
 	LastMover  CellState
 	LastInfect int
 }
 
 var (
-	CoordOf [BoardN]HexCoord // index -> 坐标
-	IndexOf map[HexCoord]int // 坐标 -> index（仅入口/出口处用）
-	NeighI  [BoardN][]int    // 每个格子的 6 邻居下标
-	JumpI   [BoardN][]int    // 每个格子的跳跃可达下标（两格）
-	Coords  [BoardN]HexCoord
+	CoordOf   [BoardN]HexCoord // index -> 坐标
+	IndexOf   map[HexCoord]int // 坐标 -> index（仅入口/出口处用）
+	NeighI    [BoardN][]int    // 每个格子的 6 邻居下标
+	NeighMask [BoardN]uint64   // 每个格子的 6 邻居位掩码
+	JumpI     [BoardN][]int    // 每个格子的跳跃可达下标（两格）
+	Coords    [BoardN]HexCoord
 )
 
 var boardPool = sync.Pool{
@@ -96,6 +98,7 @@ func initBoardTables() {
 			n := HexCoord{c.Q + d.Q, c.R + d.R}
 			if j, ok := IndexOf[n]; ok {
 				NeighI[i] = append(NeighI[i], j)
+				NeighMask[i] |= uint64(1) << uint(j)
 			}
 		}
 		// 预计算跳跃：12 个方向（= 两步）
@@ -117,11 +120,13 @@ func AllCoords(radius int) []HexCoord {
 func acquireBoard(radius int) *Board {
 	b := boardPool.Get().(*Board)
 	b.radius = radius
-	// 清空棋盘 & hash
+	// 清空棋盘 & hash & bitmask
 	for i := 0; i < BoardN; i++ {
 		b.Cells[i] = Empty
 	}
 	b.hash = 0
+	b.bitA = 0
+	b.bitB = 0
 	b.LastMove = Move{}
 	b.LastMover = Empty
 	b.LastInfect = 0
@@ -167,9 +172,23 @@ func (b *Board) setI(i int, s CellState) {
 	if prev == s {
 		return
 	}
+	// 增量维护 zobrist
 	b.hash ^= zobKeyI(i, prev)
+	// 增量维护 bitmask
+	mask := uint64(1) << uint(i)
+	if prev == PlayerA {
+		b.bitA &= ^mask
+	} else if prev == PlayerB {
+		b.bitB &= ^mask
+	}
+
 	b.Cells[i] = s
 	b.hash ^= zobKeyI(i, s)
+	if s == PlayerA {
+		b.bitA |= mask
+	} else if s == PlayerB {
+		b.bitB |= mask
+	}
 }
 
 // Neighbors returns all in-bounds neighbor coordinates of c.
@@ -207,10 +226,10 @@ func abs(x int) int {
 
 func (b *Board) Clone() *Board {
 	nb := acquireBoard(b.radius)
-	for coord, state := range b.Cells {
-		nb.Cells[coord] = state
-	}
+	nb.Cells = b.Cells // Direct array copy
 	nb.hash = b.hash
+	nb.bitA = b.bitA
+	nb.bitB = b.bitB
 	nb.LastMove = b.LastMove
 
 	nb.LastMover = b.LastMover
@@ -218,7 +237,7 @@ func (b *Board) Clone() *Board {
 	return nb
 }
 
-func (b *Board) applyMove(m Move, player CellState) (infected int, undo func()) {
+func (b *Board) ApplyMoveWithUndo(m Move, player CellState) (infected int, undo func()) {
 	opp := Opponent(player)
 
 	// 将坐标映射为下标（board 初始化时已填好 indexOf）
@@ -244,8 +263,21 @@ func (b *Board) applyMove(m Move, player CellState) (infected int, undo func()) 
 		}
 		// 增量维护 zobrist
 		b.hash ^= zobKeyI(i, prev)
+		// 增量维护 bitmask
+		mask := uint64(1) << uint(i)
+		if prev == PlayerA {
+			b.bitA &= ^mask
+		} else if prev == PlayerB {
+			b.bitB &= ^mask
+		}
+
 		b.Cells[i] = s
 		b.hash ^= zobKeyI(i, s)
+		if s == PlayerA {
+			b.bitA |= mask
+		} else if s == PlayerB {
+			b.bitB |= mask
+		}
 
 		changed = append(changed, change{i: i, prev: prev})
 	}
@@ -274,13 +306,25 @@ func (b *Board) applyMove(m Move, player CellState) (infected int, undo func()) 
 	undo = func() {
 		for k := len(changed) - 1; k >= 0; k-- {
 			c := changed[k]
-			// 通过 setI 还原可以再次维护 hash；但 setI 会再次记录 change。
-			// 因此这里直接手动还原更省：反异或 + 赋值 + 再异或。
 			cur := b.Cells[c.i]
 			if cur != c.prev {
+				// 增量维护 zobrist
 				b.hash ^= zobKeyI(c.i, cur)
+				// 增量维护 bitmask
+				mask := uint64(1) << uint(c.i)
+				if cur == PlayerA {
+					b.bitA &= ^mask
+				} else if cur == PlayerB {
+					b.bitB &= ^mask
+				}
+
 				b.Cells[c.i] = c.prev
 				b.hash ^= zobKeyI(c.i, c.prev)
+				if c.prev == PlayerA {
+					b.bitA |= mask
+				} else if c.prev == PlayerB {
+					b.bitB |= mask
+				}
 			}
 		}
 	}
@@ -326,7 +370,7 @@ func (b *Board) ToFeatureInto(side CellState, dst []float32) []float32 {
 }
 
 func (b *Board) ApplyMove(m Move, player CellState) {
-	infected, _ := b.applyMove(m, player)
+	infected, _ := b.ApplyMoveWithUndo(m, player)
 	b.LastMove = m
 	b.LastMover = player    // 新增
 	b.LastInfect = infected // 新增

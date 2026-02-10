@@ -1,6 +1,8 @@
 // file: internal/game/evaluate.go
 package game
 
+import "math/bits"
+
 // 可调参数
 var (
 	cloneThresh = 0.25      // 克隆/跳跃阈值
@@ -283,14 +285,16 @@ func previewInfectedCount(b *Board, mv Move, player CellState) int {
 	if !ok {
 		return 0
 	}
-	opp := Opponent(player)
-	count := 0
-	for _, nb := range NeighI[to] {
-		if b.Cells[nb] == opp {
-			count++
-		}
+	// 获取对手位掩码
+	var opBit uint64
+	if player == PlayerA {
+		opBit = b.bitB
+	} else {
+		opBit = b.bitA
 	}
-	return count
+
+	// 位运算：邻居掩码 & 对手掩码，然后计算 1 的个数
+	return bits.OnesCount64(NeighMask[to] & opBit)
 }
 func addHex(a, b HexCoord) HexCoord { return HexCoord{Q: a.Q + b.Q, R: a.R + b.R} }
 

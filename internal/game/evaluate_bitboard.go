@@ -74,16 +74,10 @@ func ensurePrecomp() {
 // ---- 位板工具 ----
 
 func boardMasks(b *Board, player CellState) (my, op uint64) {
-	opp := Opponent(player)
-	for i := 0; i < BoardN; i++ {
-		switch b.Cells[i] {
-		case player:
-			my |= bbCache.indexBit[i]
-		case opp:
-			op |= bbCache.indexBit[i]
-		}
+	if player == PlayerA {
+		return b.bitA, b.bitB
 	}
-	return
+	return b.bitB, b.bitA
 }
 
 func floodComponent(seed, mask uint64) uint64 {
@@ -162,6 +156,9 @@ var (
 )
 
 func Evaluate(b *Board, player CellState) int {
+	if (player == PlayerA && UseONNXForPlayerA) || (player == PlayerB && UseONNXForPlayerB) {
+		return EvaluateNN(b, player)
+	}
 	return EvaluateBitBoard(b, player)
 }
 

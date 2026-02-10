@@ -32,6 +32,8 @@ func cloneBoardPool(b *Board) *Board {
 	// 直接结构字段拷贝（array 是值拷贝）
 	nb.Cells = b.Cells
 	nb.hash = b.hash
+	nb.bitA = b.bitA
+	nb.bitB = b.bitB
 
 	nb.LastMove = b.LastMove
 	nb.LastMover = b.LastMover
@@ -46,6 +48,8 @@ func cloneBoard(b *Board) *Board {
 		radius:     b.radius,
 		Cells:      b.Cells, // 数组值拷贝
 		hash:       b.hash,
+		bitA:       b.bitA,
+		bitB:       b.bitB,
 		LastMove:   b.LastMove,
 		LastMover:  b.LastMover,
 		LastInfect: b.LastInfect,
@@ -82,14 +86,27 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 
 	// 特殊优化：如果深度为 1 且启用 NN，直接使用批量推理
 	if depth == 1 && useNN {
+		// 使用池化棋盘以减少内存分配
 		batchBoards := make([]*Board, len(moves))
+		opp := Opponent(player)
+		
 		for i, mv := range moves {
-			nb := b.Clone()
+			// 从池中获取或临时克隆一个，但尽量复用
+			nb := acquireBoard(b.radius)
+			nb.Cells = b.Cells
+			nb.bitA = b.bitA
+			nb.bitB = b.bitB
 			nb.ApplyMove(mv, player)
 			batchBoards[i] = nb
 		}
-		opp := Opponent(player)
+		
 		scores, err := KataBatchValueScore(batchBoards, opp)
+		
+		// 释放棋盘回池
+		for _, nb := range batchBoards {
+			releaseBoard(nb)
+		}
+		
 		if err == nil {
 			for i, s := range scores {
 				results[i] = scored{mv: moves[i], score: -s}
@@ -149,12 +166,17 @@ func FindBestMoveAtDepth(b *Board, player CellState, depth int64, allowJump bool
 		go func() {
 			defer wg.Done()
 			localBoard := b.Clone() // 每个线程私有 Board
+			var localNodes int64
 			for t := range taskChan {
 				undo := mMakeMoveWithUndo(localBoard, t.mv, player)
 				// 初始 alpha/beta 窗口
-				score := hybridAlphaBeta(localBoard, 0, Opponent(player), player, depth-1, -1000000, 1000000, allowJump)
+				score := hybridAlphaBeta(localBoard, 0, Opponent(player), player, depth-1, -1000000, 1000000, allowJump, &localNodes)
 				localBoard.UnmakeMove(undo)
 				results[t.idx] = scored{mv: t.mv, score: score}
+			}
+			// 同步剩余节点
+			if localNodes > 0 {
+				AddNodes(localNodes)
 			}
 		}()
 	}
@@ -185,6 +207,7 @@ func hybridAlphaBeta(
 	depth int64,
 	alpha, beta int,
 	allowJump bool,
+	localNodes *int64, // 新增：局部计数器
 ) int {
 	useNN := (original == PlayerA && UseONNXForPlayerA) || (original == PlayerB && UseONNXForPlayerB)
 
@@ -192,59 +215,14 @@ func hybridAlphaBeta(
 		if useNN {
 			// 始终以“轮到谁走”的视角评估，然后根据是否是 original 决定正负
 			v := EvaluateNN(b, current)
-			if current != original { return -v }
-			return v
-		}
-		return EvaluateBitBoard(b, original)
-	}
-
-	incNodes()
-	moves := GenerateMoves(b, current)
-	moves = applyMoveFilters(b, current, moves, allowJump)
-
-	if len(moves) == 0 {
-		if useNN {
-			v := EvaluateNN(b, current)
-			if current != original { return -v }
-			return v
-		}
-		return EvaluateBitBoard(b, original)
-	}
-
-	// 深度 2 优化：在叶子节点上一层进行批量评估
-	if depth == 1 && useNN {
-		batchBoards := make([]*Board, len(moves))
-		for i, mv := range moves {
-			nb := b.Clone()
-			nb.ApplyMove(mv, current)
-			batchBoards[i] = nb
-		}
-		// 关键修复：落子后轮到 Opponent(current) 走，以此视角评估
-		nextP := Opponent(current)
-		scores, err := KataBatchValueScore(batchBoards, nextP)
-		if err == nil {
-			best := 0
-			if current == original { // MAX 节点
-				best = -1000000
-				for _, s := range scores {
-					// 这里的 s 是 nextP 的分，我们要 original 的分
-					// 因为 nextP != original (因为 current == original)，所以 sOrig = -s
-					sOrig := -s
-					if sOrig > best { best = sOrig }
-				}
-			} else { // MIN 节点
-				best = 1000000
-				for _, s := range scores {
-					// 这里 nextP == original (因为 current != original)，所以 sOrig = s
-					sOrig := s
-					if sOrig < best { best = sOrig }
-				}
+			if current != original {
+				return -v
 			}
-			return best
+			return v
 		}
+		return EvaluateBitBoard(b, original)
 	}
 
-	// 标准 Alpha-Beta 递归
 	ttKey := ttKeyFor(b, current)
 	if hit, valCur, flag := probeTT(ttKey, int(depth)); hit {
 		val := valCur
@@ -267,6 +245,77 @@ func hybridAlphaBeta(
 			return val
 		}
 	}
+
+	if localNodes != nil {
+		*localNodes++
+		if *localNodes >= 1024 {
+			AddNodes(*localNodes)
+			*localNodes = 0
+		}
+	} else {
+		incNodes()
+	}
+
+	moves := GenerateMoves(b, current)
+	moves = applyMoveFilters(b, current, moves, allowJump)
+
+	if len(moves) == 0 {
+		if useNN {
+			v := EvaluateNN(b, current)
+			if current != original {
+				return -v
+			}
+			return v
+		}
+		return EvaluateBitBoard(b, original)
+	}
+
+	// 深度 2 优化：在叶子节点上一层进行批量评估
+	if depth == 1 && useNN {
+		batchBoards := make([]*Board, len(moves))
+		for i, mv := range moves {
+			nb := acquireBoard(b.radius)
+			nb.Cells = b.Cells
+			nb.bitA = b.bitA
+			nb.bitB = b.bitB
+			nb.ApplyMove(mv, current)
+			batchBoards[i] = nb
+		}
+		// 关键修复：落子后轮到 Opponent(current) 走，以此视角评估
+		nextP := Opponent(current)
+		scores, err := KataBatchValueScore(batchBoards, nextP)
+		
+		// 释放棋盘
+		for _, nb := range batchBoards {
+			releaseBoard(nb)
+		}
+		
+		if err == nil {
+			best := 0
+			if current == original { // MAX 节点
+				best = -1000000
+				for _, s := range scores {
+					// 这里的 s 是 nextP 的分，我们要 original 的分
+					// 因为 nextP != original (因为 current == original)，所以 sOrig = -s
+					sOrig := -s
+					if sOrig > best {
+						best = sOrig
+					}
+				}
+			} else { // MIN 节点
+				best = 1000000
+				for _, s := range scores {
+					// 这里 nextP == original (因为 current != original)，所以 sOrig = s
+					sOrig := s
+					if sOrig < best {
+						best = sOrig
+					}
+				}
+			}
+			return best
+		}
+	}
+
 	alphaOrig, betaOrig := alpha, beta
 
 	if ok, idx := probeBestIdx(ttKey); ok {
@@ -283,7 +332,7 @@ func hybridAlphaBeta(
 		bestScore = math.MinInt32
 		for i, mv := range moves {
 			undo := mMakeMoveWithUndo(b, mv, current)
-			score := hybridAlphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump)
+			score := hybridAlphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump, localNodes)
 			b.UnmakeMove(undo)
 			if score > bestScore {
 				bestScore = score
@@ -300,7 +349,7 @@ func hybridAlphaBeta(
 		bestScore = math.MaxInt32
 		for i, mv := range moves {
 			undo := mMakeMoveWithUndo(b, mv, current)
-			score := hybridAlphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump)
+			score := hybridAlphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump, localNodes)
 			b.UnmakeMove(undo)
 			if score < bestScore {
 				bestScore = score
@@ -333,6 +382,7 @@ func hybridAlphaBeta(
 	return bestScore
 }
 
+
 // ------------------------------------------------------------
 // α-β + 置换表
 // ------------------------------------------------------------
@@ -359,29 +409,12 @@ func alphaBeta(
 	depth int64,
 	alpha, beta int,
 	allowJump bool,
+	localNodes *int64, // 新增：局部计数器
 ) int {
-	incNodes()
-	// 1) 走法生成（含 UI 禁跳）
-	moves := GenerateMoves(b, current)
-	moves = applyMoveFilters(b, current, moves, allowJump)
-
-	if depth == 0 || len(moves) == 0 {
-		// original 视角的评估：使用 Evaluate 包装器（支持 ONNX）
-		valOrig := Evaluate(b, original)
-
-		// 存 TT 用 current 视角（与 key 里的 current 对齐）
-		valTT := valOrig
-		if current != original {
-			valTT = -valOrig
-		}
-		ttKey := ttKeyFor(b, current)
-		storeTT(ttKey, int(depth), valTT, ttExact)
-
-		// 返回仍用 original 视角
-		return valOrig
+	if depth <= 0 {
+		return Evaluate(b, original)
 	}
 
-	// 3) 置换表探测（混入 side）
 	ttKey := ttKeyFor(b, current)
 	if hit, valCur, flag := probeTT(ttKey, int(depth)); hit {
 		// valCur 是 current 视角；转回 original
@@ -405,6 +438,25 @@ func alphaBeta(
 			return val
 		}
 	}
+
+	if localNodes != nil {
+		*localNodes++
+		if *localNodes >= 1024 {
+			AddNodes(*localNodes)
+			*localNodes = 0
+		}
+	} else {
+		incNodes()
+	}
+
+	// 1) 走法生成（含 UI 禁跳）
+	moves := GenerateMoves(b, current)
+	moves = applyMoveFilters(b, current, moves, allowJump)
+
+	if len(moves) == 0 {
+		return Evaluate(b, original)
+	}
+
 	alphaOrig, betaOrig := alpha, beta
 
 	// 4) 如果 TT 里存了该节点的最佳索引，交换到首位以提升剪枝效率
@@ -426,14 +478,9 @@ func alphaBeta(
 		for i, mv := range moves {
 			undo := mMakeMoveWithUndo(b, mv, current)
 
-			score := alphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump)
+			score := alphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump, localNodes)
 
 			b.UnmakeMove(undo)
-
-			// 可选：对跳跃加一个固定惩罚，与你现有逻辑一致
-			//if mv.IsJump() && !useLearned {
-			//	score -= jumpMovePenalty
-			//}
 
 			if score > bestScore {
 				bestScore = score
@@ -453,14 +500,9 @@ func alphaBeta(
 		for i, mv := range moves {
 			undo := mMakeMoveWithUndo(b, mv, current)
 
-			score := alphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump)
+			score := alphaBeta(b, 0, Opponent(current), original, depth-1, alpha, beta, allowJump, localNodes)
 
 			b.UnmakeMove(undo)
-
-			// 与你现有逻辑一致：如果也想让 MIN 讨厌跳跃，就加正分
-			//if mv.IsJump() && !useLearned {
-			//	score += jumpMovePenalty
-			//}
 
 			if score < bestScore {
 				bestScore = score
@@ -496,6 +538,7 @@ func alphaBeta(
 
 	return bestScore
 }
+
 
 // ------------------------------------------------------------
 func max(a, b int) int {
@@ -555,7 +598,7 @@ func findImmediateWinOnly(b *Board, p CellState) (Move, bool) {
 
 func DeepSearch(b *Board, hash uint64, side CellState, depth int) int {
 
-	return alphaBeta(b, hash, side, side, int64(depth), -32000, 32000, true)
+	return alphaBeta(b, hash, side, side, int64(depth), -32000, 32000, true, nil)
 }
 
 func IterativeDeepening(
@@ -591,7 +634,8 @@ func AlphaBeta(b *Board, player CellState, depth int) int {
 		int64(depth),
 		math.MinInt, // 初始 α
 		math.MaxInt, // 初始 β
-		true)
+		true,
+		nil)
 }
 
 // alphaBetaNoTT 在 b 上执行一次不带置换表的 α–β 搜索。
@@ -679,6 +723,8 @@ func applyMoveFilters(b *Board, side CellState, moves []Move, allowJump bool) []
 		useNN = true
 	}
 	
+	// 这里必须小心：如果 GenerateMoves 返回的是预分配缓冲区的切片，或者我们连续调用多个原地过滤器，
+	// 逻辑必须闭环。
 	out := filterJumpsByFlag(b, side, moves, allowJump)
 	
 	if useNN {
@@ -703,25 +749,27 @@ func applyMoveFilters(b *Board, side CellState, moves []Move, allowJump bool) []
 
 // 根节点/任意节点可复用的过滤器：尽量剔除“0 感染跳跃”，但保证不至于空集合
 func filterZeroInfectJumpsOrFallback(b *Board, side CellState, moves []Move) []Move {
-	filtered := make([]Move, 0, len(moves))
+	n := 0
 	for _, mv := range moves {
 		if mv.IsJump() && previewInfectedCount(b, mv, side) == 0 {
 			continue
 		}
-		filtered = append(filtered, mv)
+		moves[n] = mv
+		n++
 	}
-	if len(filtered) > 0 {
-		return filtered
+	if n > 0 {
+		return moves[:n]
 	}
 	// 如果全被剔空了，至少保留克隆；再不行就原样返回，避免无解
-	clones := make([]Move, 0, len(moves))
+	n = 0
 	for _, mv := range moves {
 		if mv.IsClone() {
-			clones = append(clones, mv)
+			moves[n] = mv
+			n++
 		}
 	}
-	if len(clones) > 0 {
-		return clones
+	if n > 0 {
+		return moves[:n]
 	}
 	return moves
 }
@@ -730,17 +778,21 @@ func filterZeroInfectJumpsOrFallback(b *Board, side CellState, moves []Move) []M
 // 保守起见：若全被删光，则回退原 moves。
 func filterDangerousRecaptureJumps(b *Board, me CellState, moves []Move) []Move {
 	op := Opponent(me)
-	out := make([]Move, 0, len(moves))
+	n := 0
+	fullCount := len(moves)
 
-	for _, mv := range moves {
+	for i := 0; i < fullCount; i++ {
+		mv := moves[i]
 		// 只针对跳跃
 		if !mv.IsJump() {
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 			continue
 		}
 		toIdx, ok := IndexOf[mv.To]
 		if !ok {
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 			continue
 		}
 
@@ -760,7 +812,8 @@ func filterDangerousRecaptureJumps(b *Board, me CellState, moves []Move) []Move 
 			// inf == 单一被感染格的下标
 		} else {
 			// 0 或 >=2，不做这个危险判定（按你描述只针对“感染1子”）
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 			continue
 		}
 
@@ -783,14 +836,15 @@ func filterDangerousRecaptureJumps(b *Board, me CellState, moves []Move) []Move 
 		}
 
 		if !danger {
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 		}
 	}
 
-	if len(out) == 0 {
-		return moves
+	if n == 0 {
+		return moves[:fullCount]
 	}
-	return out
+	return moves[:n]
 }
 
 // 开局启发：在未发生过感染前，只允许沿边缘的克隆（from/to 都在外圈，且是克隆）。
@@ -799,16 +853,19 @@ func filterOpeningEdgeOnly(b *Board, side CellState, moves []Move) []Move {
 	if infectionUnlocked(b) {
 		return moves
 	}
-	filtered := make([]Move, 0, len(moves))
-	for _, mv := range moves {
+	n := 0
+	fullCount := len(moves)
+	for i := 0; i < fullCount; i++ {
+		mv := moves[i]
 		if mv.IsClone() && isOuterI[IndexOf[mv.From]] && isOuterI[IndexOf[mv.To]] {
-			filtered = append(filtered, mv)
+			moves[n] = mv
+			n++
 		}
 	}
-	if len(filtered) == 0 {
-		return moves
+	if n == 0 {
+		return moves[:fullCount]
 	}
-	return filtered
+	return moves[:n]
 }
 
 // 粗略判定是否已“解锁”：上一手有感染，或当前棋面存在相邻异色棋子。
@@ -939,32 +996,39 @@ func filterDangerousIsolatedClones(b *Board, me CellState, moves []Move) []Move 
 		return moves
 	}
 
-	out := make([]Move, 0, len(moves))
-	for _, mv := range moves {
+	n := 0
+	originalCount := len(moves)
+	for i := 0; i < originalCount; i++ {
+		mv := moves[i]
 		if isDangerousIsolatedClone(b, me, mv) {
 			continue
 		}
-		out = append(out, mv)
+		moves[n] = mv
+		n++
 	}
-	if len(out) > 0 {
-		return out
+	if n > 0 {
+		return moves[:n]
 	}
-	return moves // 全被删光就回退
+	return moves[:originalCount] // 全被删光就回退
 }
 
 // 过滤“克隆且不吃子，但对手下一步可以到达 from/to 的共同邻居并感染这两个子”的招法。
 // 若全删光则回退原 moves。
 func filterVulnerableZeroInfClones(b *Board, me CellState, moves []Move) []Move {
 	op := Opponent(me)
-	out := make([]Move, 0, len(moves))
-	for _, mv := range moves {
+	n := 0
+	originalCount := len(moves)
+	for i := 0; i < originalCount; i++ {
+		mv := moves[i]
 		if !mv.IsClone() {
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 			continue
 		}
 		// 仅关注“未吃子”的克隆
 		if previewInfectedCount(b, mv, me) != 0 {
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 			continue
 		}
 		// 寻找 from/to 的共同邻居空位，若对手可一手到达则视为危险
@@ -981,13 +1045,14 @@ func filterVulnerableZeroInfClones(b *Board, me CellState, moves []Move) []Move 
 			}
 		}
 		if !danger {
-			out = append(out, mv)
+			moves[n] = mv
+			n++
 		}
 	}
-	if len(out) == 0 {
-		return moves
+	if n == 0 {
+		return moves[:originalCount]
 	}
-	return out
+	return moves[:n]
 }
 func opponentCanJumpTo(b *Board, op CellState, dst HexCoord) bool {
 	// 坐标 -> 下标

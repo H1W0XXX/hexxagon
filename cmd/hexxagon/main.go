@@ -4,6 +4,7 @@ import (
 	"flag"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/audio"
+	"hexxagon_go/internal/game"
 	"hexxagon_go/internal/ui"
 	"log"
 )
@@ -53,6 +54,9 @@ func main() {
 	aiEnabled := (*modeFlag == "pve") // pve=启用 AI，pvp=禁用 AI
 	aiDepth := *depthFlag
 	showScores := *showScoresFlag
+
+	// 在后台立即开始初始化 ONNX/TensorRT 编译
+	game.PreloadModels()
 
 	ctx := audio.NewContext(sampleRate)
 	if ctx == nil {

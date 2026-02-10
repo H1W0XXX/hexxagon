@@ -46,6 +46,9 @@ var NodesSearched int64
 func ResetNodes() { NodesSearched = 0 }
 func incNodes()   { atomic.AddInt64(&NodesSearched, 1) }
 
+// AddNodes 批量增加节点计数，减少原子操作竞争
+func AddNodes(n int64) { atomic.AddInt64(&NodesSearched, n) }
+
 func SetPhaseSwitch(ps PhaseSwitch) { phaseSwitch = ps }
 
 // 只在一个阶段里用 CNN；其余阶段一律用“你的静态评估”
@@ -266,11 +269,15 @@ func FindBestMoveAtDepthHybrid(b *Board, player CellState, depth int64, allowJum
 				_ = nb
 			}()
 
+			var localNodes int64
 			for mv := range jobs {
 				undo := mMakeMoveWithUndo(nb, mv, player)
-				score := alphaBeta(nb, 0, Opponent(player), player, depth-1, alphaRoot, betaRoot, true)
+				score := alphaBeta(nb, 0, Opponent(player), player, depth-1, alphaRoot, betaRoot, true, &localNodes)
 				nb.UnmakeMove(undo)
 				results <- result{mv: mv, score: score}
+			}
+			if localNodes > 0 {
+				AddNodes(localNodes)
 			}
 		}()
 	}
