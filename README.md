@@ -8,7 +8,9 @@ Hexxagon（中文译名：疯狂跳棋、征服六边形、水晶棋等）是一
 
 ## 📺 游戏演示
 
-![Hexxagon Demo](demo_github.mp4)
+<div align="center">
+  <video src="https://github.com/user-attachments/assets/051a1d2f-ab60-4efa-bec8-ae2090eaa9b7" width="600" controls muted autoplay loop></video>
+</div>
 
 ## 📜 游戏规则
 
