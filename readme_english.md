@@ -8,9 +8,7 @@ Hexxagon is a strategic game played on a 61-cell hexagonal grid.
 
 ## 📺 Game Demonstration
 
-<div align="center">
-  <video src="demo_github.mp4" width="600" controls muted autoplay loop></video>
-</div>
+![Hexxagon Demo](demo_github.mp4)
 
 ### 1. Board and Pieces
 - The board consists of 61 hexagonal cells (radius 4).
