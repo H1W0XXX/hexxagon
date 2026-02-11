@@ -55,7 +55,7 @@ func ensureONNX() error {
 				return
 			}
 			externalModel = b
-			log.Printf("[ensureONNX] using external ONNX: %s", path)
+			log.Printf("[ensureONNX] using external ONNX: %s%s", path, ansiReset)
 		} else {
 			// 尝试从 embed 的 assets 目录找任意 .onnx
 			entries, err := embeddedFS.ReadDir("assets")
@@ -68,10 +68,10 @@ func ensureONNX() error {
 						b, rerr := embeddedFS.ReadFile("assets/" + e.Name())
 						if rerr == nil {
 							externalModel = b
-							log.Printf("[ensureONNX] using embedded ONNX: assets/%s", e.Name())
+							log.Printf("[ensureONNX] using embedded ONNX: assets/%s%s", e.Name(), ansiReset)
 							break
 						}
-						ortErr = fmt.Errorf("read embedded assets/%s: %w", e.Name(), rerr)
+						ortErr = fmt.Errorf("read embedded assets/%s: %w%s", e.Name(), rerr, ansiReset)
 						return
 					}
 				}
@@ -84,16 +84,17 @@ func ensureONNX() error {
 			ortErr = fmt.Errorf("prepare ORT lib: %w", err)
 			return
 		}
-		log.Printf("[ensureONNX] using ORT shared lib: %s", libPath)
+		log.Printf("[ensureONNX] using ORT shared lib: %s%s", libPath, ansiReset)
 		ort.SetSharedLibraryPath(libPath)
 
 		// 2) 初始化 ORT
 		if err := ort.InitializeEnvironment(); err != nil {
 			ortErr = fmt.Errorf("InitializeEnvironment: %w", err)
-			log.Printf("[ensureONNX] InitializeEnvironment failed: %v", ortErr)
+			log.Printf("[ensureONNX] InitializeEnvironment failed: %v%s", ortErr, ansiReset)
 			return
 		}
-		log.Printf("[ensureONNX] InitializeEnvironment succeeded")
+		fmt.Print(ansiReset)
+		log.Printf("[ensureONNX] InitializeEnvironment succeeded%s", ansiReset)
 
 		// 3) 模型字节自检（外部优先，否则 embed）
 		modelBytes := externalModel
@@ -106,7 +107,7 @@ func ensureONNX() error {
 			ortErr = fmt.Errorf("GetInputOutputInfoWithONNXData: %w", gierr)
 			return
 		}
-		log.Printf("[ensureONNX] model IO info: inputs=%v outputs=%v", inputs, outputs)
+		log.Printf("[ensureONNX] model IO info: inputs=%v outputs=%v%s", inputs, outputs, ansiReset)
 
 		// 4) 创建 I/O 张量（必须在 InitializeEnvironment 之后）
 		var e error
@@ -132,26 +133,66 @@ func ensureONNX() error {
 			ortErr = fmt.Errorf("NewSessionOptions: %w", err)
 			return
 		}
-
-		// 可选：图优化更激进（不同版本接口名可能略有不同，可省略）
-		// _ = so.SetGraphOptimizationLevel(ort.GraphOptimizationLevelAll)
-
-		if runtime.GOOS == "windows" {
-			if cudaOpts, e := ort.NewCUDAProviderOptions(); e == nil && cudaOpts != nil {
-				// 可选：设置 device_id 等；值用字符串
-				// 参考官方配置键：https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html#configuration-options
-				_ = cudaOpts.Update(map[string]string{
-					"device_id": "0",
-					// "arena_extend_strategy": "kNextPowerOfTwo",
-					// "gpu_mem_limit": "0",
-				})
-				if err := so.AppendExecutionProviderCUDA(cudaOpts); err != nil {
-					log.Printf("[ensureONNX] CUDA EP init failed, fallback to CPU: %v", err)
-				}
-				_ = cudaOpts.Destroy()
-			} else {
-				log.Printf("[ensureONNX] NewCUDAProviderOptions failed, fallback to CPU: %v", e)
+		_ = so.SetLogSeverityLevel(3)
+		
+		// 优先尝试 GPU 加速
+		gpuEnabled := false
+		if runtime.GOOS == "darwin" {
+			// macOS: CoreML
+			if err := so.AppendExecutionProviderCoreMLV2(map[string]string{
+				"use_ane": "1",
+			}); err == nil {
+				log.Printf("[ensureONNX] CoreML Execution Provider enabled.%s", ansiReset)
+				gpuEnabled = true
 			}
+		} else if runtime.GOOS == "windows" {
+			// Windows: TensorRT -> CUDA -> DirectML
+			if trtOpts, e := ort.NewTensorRTProviderOptions(); e == nil {
+				trtOpts.Update(map[string]string{"trt_fp16_enable": "1"})
+				if err := so.AppendExecutionProviderTensorRT(trtOpts); err == nil {
+					log.Printf("[ensureONNX] TensorRT Execution Provider enabled.%s", ansiReset)
+					gpuEnabled = true
+				}
+				trtOpts.Destroy()
+			}
+			if !gpuEnabled {
+				if cudaOpts, e := ort.NewCUDAProviderOptions(); e == nil {
+					if err := so.AppendExecutionProviderCUDA(cudaOpts); err == nil {
+						log.Printf("[ensureONNX] CUDA Execution Provider enabled.%s", ansiReset)
+						gpuEnabled = true
+					}
+					cudaOpts.Destroy()
+				}
+			}
+			if !gpuEnabled {
+				if err := so.AppendExecutionProviderDirectML(0); err == nil {
+					log.Printf("[ensureONNX] DirectML Execution Provider enabled.%s", ansiReset)
+					gpuEnabled = true
+				}
+			}
+		} else {
+			// Linux: TensorRT -> CUDA
+			if trtOpts, e := ort.NewTensorRTProviderOptions(); e == nil {
+				trtOpts.Update(map[string]string{"trt_fp16_enable": "1"})
+				if err := so.AppendExecutionProviderTensorRT(trtOpts); err == nil {
+					log.Printf("[ensureONNX] TensorRT Execution Provider enabled.%s", ansiReset)
+					gpuEnabled = true
+				}
+				trtOpts.Destroy()
+			}
+			if !gpuEnabled {
+				if cudaOpts, e := ort.NewCUDAProviderOptions(); e == nil {
+					if err := so.AppendExecutionProviderCUDA(cudaOpts); err == nil {
+						log.Printf("[ensureONNX] CUDA Execution Provider enabled.%s", ansiReset)
+						gpuEnabled = true
+					}
+					cudaOpts.Destroy()
+				}
+			}
+		}
+
+		if !gpuEnabled {
+			log.Printf("[ensureONNX] No GPU acceleration enabled, falling back to CPU.%s", ansiReset)
 		}
 
 		ortSess, e = ort.NewAdvancedSessionWithONNXData(
@@ -166,10 +207,10 @@ func ensureONNX() error {
 			ortErr = fmt.Errorf("NewAdvancedSessionWithONNXData: %v", e)
 			return
 		}
-		log.Printf("[ensureONNX] AdvancedSession created successfully (memory)")
+		log.Printf("[ensureONNX] AdvancedSession created successfully (memory)%s", ansiReset)
 	})
 	if ortErr != nil {
-		log.Printf("[ensureONNX] returning error: %v", ortErr)
+		log.Printf("[ensureONNX] returning error: %v%s", ortErr, ansiReset)
 	}
 	return ortErr
 }

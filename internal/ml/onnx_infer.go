@@ -79,7 +79,7 @@ func ensureInit() error {
 			}
 		}
 
-		// 3) 会话选项（可选 CUDA）
+		// 3) 会话选项
 		sessOpts, err := ort.NewSessionOptions()
 		if err != nil {
 			initErr = fmt.Errorf("ort.NewSessionOptions: %w", err)
@@ -87,19 +87,52 @@ func ensureInit() error {
 		}
 		defer sessOpts.Destroy()
 
-		if useCUDA {
-			cuOpts, err := ort.NewCUDAProviderOptions()
-			if err == nil {
-				// 不设置额外选项，按默认 deviceID=0 等
-				if err = sessOpts.AppendExecutionProviderCUDA(cuOpts); err != nil {
-					// 失败退回 CPU，不报错
-					useCUDA = false
+		gpuEnabled := false
+		if runtime.GOOS == "darwin" {
+			if err := sessOpts.AppendExecutionProviderCoreMLV2(map[string]string{"use_ane": "1"}); err == nil {
+				gpuEnabled = true
+			}
+		} else if runtime.GOOS == "windows" {
+			// Try TensorRT then CUDA then DirectML
+			if trtOpts, e := ort.NewTensorRTProviderOptions(); e == nil {
+				if err := sessOpts.AppendExecutionProviderTensorRT(trtOpts); err == nil {
+					gpuEnabled = true
 				}
-				_ = cuOpts.Destroy()
-			} else {
-				useCUDA = false
+				trtOpts.Destroy()
+			}
+			if !gpuEnabled {
+				if cuOpts, e := ort.NewCUDAProviderOptions(); e == nil {
+					if err := sessOpts.AppendExecutionProviderCUDA(cuOpts); err == nil {
+						gpuEnabled = true
+					}
+					cuOpts.Destroy()
+				}
+			}
+			if !gpuEnabled {
+				if err := sessOpts.AppendExecutionProviderDirectML(0); err == nil {
+					gpuEnabled = true
+				}
 			}
 		}
+
+		if !gpuEnabled && runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+			// Other OS (Linux): Try TensorRT then CUDA
+			if trtOpts, e := ort.NewTensorRTProviderOptions(); e == nil {
+				if err := sessOpts.AppendExecutionProviderTensorRT(trtOpts); err == nil {
+					gpuEnabled = true
+				}
+				trtOpts.Destroy()
+			}
+			if !gpuEnabled {
+				if cuOpts, e := ort.NewCUDAProviderOptions(); e == nil {
+					if err := sessOpts.AppendExecutionProviderCUDA(cuOpts); err == nil {
+						gpuEnabled = true
+					}
+					cuOpts.Destroy()
+				}
+			}
+		}
+		state.useCUDA = gpuEnabled
 
 		// 4) 创建 DynamicAdvancedSession（推理时再绑定输入/输出张量）
 		const (
@@ -192,19 +225,19 @@ func PredictRaw(feat []float32) (policy [81]float32, value float32, err error) {
 	}
 
 	dims := []int64{1, 3, 9, 9}
-	input, err := onnx.NewTensor(onnx.TENSOR_FLOAT, dims, feat)
+	input, err := ort.NewTensor(ort.NewShape(dims...), feat)
 	if err != nil {
 		return policy, 0, fmt.Errorf("NewTensor: %w", err)
 	}
-	defer input.Release()
+	defer input.Destroy()
 
-	outs, err := state.session.Run(map[string]*onnx.Value{"x": input})
+	outs, err := state.session.Run(map[string]ort.Value{"x": input})
 	if err != nil {
 		return policy, 0, fmt.Errorf("Run: %w", err)
 	}
 	defer func() {
 		for _, v := range outs {
-			v.Release()
+			v.Destroy()
 		}
 	}()
 
@@ -212,6 +245,11 @@ func PredictRaw(feat []float32) (policy [81]float32, value float32, err error) {
 	val := mustFloat32s(outs["value"])
 	copy(policy[:], logits[:min(81, len(logits))])
 	return policy, val[0], nil
+}
+
+func mustFloat32s(v ort.Value) []float32 {
+	t := v.(*ort.Tensor[float32])
+	return t.GetData()
 }
 
 // 便捷：从内存字节设置模型（比如你想在外面下载不同版本）

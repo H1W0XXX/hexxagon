@@ -70,6 +70,13 @@ var (
 	staticSpatial     []float32 // 包含 Plane 0 (all 1) 和 Plane 3 (Blocked)
 )
 
+const ansiReset = "\033[0m"
+
+func init() {
+	// 极致尽早重定向日志，防止 PowerShell 将 stderr 误认为错误而变红
+	log.SetOutput(os.Stdout)
+}
+
 func ensureStaticSpatial() {
 	staticSpatialOnce.Do(func() {
 		staticSpatial = make([]float32, katagoPlanes*katagoGrid*katagoGrid)
@@ -111,7 +118,7 @@ func ensureKataONNX() error {
 		absCachePath := filepath.Join(baseDir, "trt_cache")
 		os.MkdirAll(absCachePath, 0755)
 		
-		// 2. 极致同步环境变量 (作为备选方案)
+		// 2. 极致同步环境变量 (设为较高级别以减少干扰日志)
 		setNativeEnv("ORT_TENSORRT_ENGINE_CACHE_ENABLE", "1")
 		setNativeEnv("ORT_TENSORRT_ENGINE_CACHE_PATH", absCachePath)
 		setNativeEnv("ORT_TENSORRT_CACHE_ENABLE", "1")
@@ -120,135 +127,216 @@ func ensureKataONNX() error {
 		setNativeEnv("ORT_TRT_CACHE_PATH", absCachePath)
 		setNativeEnv("ORT_TENSORRT_TIMING_CACHE_ENABLE", "1") 
 		setNativeEnv("ORT_TENSORRT_TIMING_CACHE_PATH", absCachePath)
+		setNativeEnv("ORT_TENSORRT_FP16_ENABLE", "1")
+		setNativeEnv("ORT_TENSORRT_MAX_WORKSPACE_SIZE", "2147483648")
 		
-		// 开启详细调试日志
-		setNativeEnv("ORT_TENSORRT_VERBOSE_LOG", "1")
-		// 通过 ORT 内部环境变量强制开启详细日志输出到 stdout/stderr
-		setNativeEnv("ORT_LOGGING_LEVEL", "0") 
+		// 设为 Error 级别 (3)，屏蔽加载失败等警告，防止 stderr 变红
+		setNativeEnv("ORT_LOGGING_LEVEL", "3") 
 		
-		log.Printf("[katago] TRT Debug: Syncing Cache to %s", absCachePath)
+		log.Printf("[katago] TRT Debug: Syncing Cache to %s%s", absCachePath, ansiReset)
 
 		// 3. 初始化环境（环境变量设置必须在此之前）
 		libPath, _ := prepareORTSharedLib()
 		ort.SetSharedLibraryPath(libPath)
 		ort.InitializeEnvironment()
+		fmt.Print(ansiReset) // 强行重置可能由 ORT 产生的颜色码
 
-		// 4. 模型落地
-		var modelPath string 
+		// 4. 模型加载 (直接加载到内存)
+		var modelData []byte
 		if path := os.Getenv("KATAGO_ONNX_PATH"); path != "" {
-			modelPath = filepath.ToSlash(path)
+			modelData, _ = os.ReadFile(path)
 		} else {
-			modelPath = filepath.Join(baseDir, "katago_model.onnx")
-			
-			// 解压并写入文件
-			if _, err := os.Stat(modelPath); os.IsNotExist(err) {
-				log.Printf("[katago] Extracting model to: %s", modelPath)
-				entries, _ := katagoFS.ReadDir("assets")
-				for _, e := range entries {
-					name := strings.ToLower(e.Name())
-					if strings.HasSuffix(name, ".onnx") || strings.HasSuffix(name, ".onnx.gz") {
-						b, err := katagoFS.ReadFile("assets/" + e.Name())
-						if err != nil { continue }
+			entries, _ := katagoFS.ReadDir("assets")
+			for _, e := range entries {
+				name := strings.ToLower(e.Name())
+				if strings.HasSuffix(name, ".onnx") || strings.HasSuffix(name, ".onnx.gz") {
+					b, err := katagoFS.ReadFile("assets/" + e.Name())
+					if err != nil { continue }
 
-						var decompressed []byte
-						if strings.HasSuffix(name, ".gz") {
-							gr, err := gzip.NewReader(bytes.NewReader(b))
-							if err == nil {
-								decompressed, _ = io.ReadAll(gr)
-								gr.Close()
-							}
-						} else {
-							decompressed = b
+					if strings.HasSuffix(name, ".gz") {
+						gr, err := gzip.NewReader(bytes.NewReader(b))
+						if err == nil {
+							modelData, _ = io.ReadAll(gr)
+							gr.Close()
 						}
-						
-						if len(decompressed) > 0 {
-							os.WriteFile(modelPath, decompressed, 0644)
-						}
-						break
+					} else {
+						modelData = b
 					}
+					break
 				}
 			}
 		}
-		log.Printf("[katago] Model Path: %s", modelPath)
 
-		if modelPath == "" {
+		if len(modelData) == 0 {
 			katagoErr = fmt.Errorf("no KataGo ONNX model found")
 			return
 		}
 
-		so, _ := ort.NewSessionOptions()
-
-		// 1. 优先尝试开启 TensorRT (使用标准库接口)
-		trtEnabled := false
-		if trtOpts, e := ort.NewTensorRTProviderOptions(); e == nil {
-			// 显式设置所有缓存相关的配置
-			trtOpts.Update(map[string]string{
-				"device_id":               "0",
-				"trt_engine_cache_enable": "1",
-				"trt_engine_cache_path":   absCachePath,
-				"trt_fp16_enable":         "1",
-				"trt_max_workspace_size":  "2147483648", // 2GB
-				"trt_timing_cache_enable": "1",
-				"trt_timing_cache_path":   absCachePath,
-			})
-			if errTrt := so.AppendExecutionProviderTensorRT(trtOpts); errTrt == nil {
-				log.Println("[katago] TensorRT Execution Provider enabled.")
-				trtEnabled = true
-			} else {
-				log.Printf("[katago] TensorRT failed to append: %v", errTrt)
-			}
-			trtOpts.Destroy()
-		}
-
-		// 2. 如果 TensorRT没开成功，尝试开启原生 CUDA
-		if !trtEnabled {
-			if cudaOpts, e := ort.NewCUDAProviderOptions(); e == nil {
-				if errCuda := so.AppendExecutionProviderCUDA(cudaOpts); errCuda == nil {
-					log.Println("[katago] CUDA Execution Provider enabled.")
-				} else {
-					log.Printf("[katago] CUDA failed to append: %v", errCuda)
-				}
-				cudaOpts.Destroy()
-			}
-		}
-
-		// 4. 初始化单步推理会话
+		// 4. 初始化推理张量 (这些可以复用)
 		katagoInSpatial, _ = ort.NewTensor(ort.NewShape(1, katagoPlanes, katagoGrid, katagoGrid), make([]float32, katagoPlanes*katagoGrid*katagoGrid))
 		katagoInGlobal, _ = ort.NewTensor(ort.NewShape(1, katagoGlobals), make([]float32, katagoGlobals))
 		katagoOutPolicy, _ = ort.NewEmptyTensor[float32](ort.NewShape(1, int64(katagoPolicyHeads), katagoGrid*katagoGrid+1))
 		katagoOutValue, _ = ort.NewEmptyTensor[float32](ort.NewShape(1, 3))
 
-		katagoSess, katagoErr = ort.NewAdvancedSession(
-			modelPath,
-			[]string{katagoInputSpatial, katagoInputGlobal},
-			[]string{katagoOutputPolicy, katagoOutputValue},
-			[]ort.Value{katagoInSpatial, katagoInGlobal},
-			[]ort.Value{katagoOutPolicy, katagoOutValue},
-			so,
-		)
-
-		// 5. 初始化批量推理会话 (Fixed Batch Size = 64)
 		katagoInSpatialB, _ = ort.NewTensor(ort.NewShape(maxBatchSize, katagoPlanes, katagoGrid, katagoGrid), make([]float32, maxBatchSize*katagoPlanes*katagoGrid*katagoGrid))
 		katagoInGlobalB, _ = ort.NewTensor(ort.NewShape(maxBatchSize, katagoGlobals), make([]float32, maxBatchSize*katagoGlobals))
 		katagoOutPolicyB, _ = ort.NewEmptyTensor[float32](ort.NewShape(maxBatchSize, int64(katagoPolicyHeads), katagoGrid*katagoGrid+1))
 		katagoOutValueB, _ = ort.NewEmptyTensor[float32](ort.NewShape(maxBatchSize, 3))
 
-		katagoSessBatch, _ = ort.NewAdvancedSession(
-			modelPath,
-			[]string{katagoInputSpatial, katagoInputGlobal},
-			[]string{katagoOutputPolicy, katagoOutputValue},
-			[]ort.Value{katagoInSpatialB, katagoInGlobalB},
-			[]ort.Value{katagoOutPolicyB, katagoOutValueB},
-			so,
-		)
+		// 5. 定义并尝试多种策略
+		type strategy struct {
+			name  string
+			setup func(*ort.SessionOptions) error
+		}
 
-		// --- 新增：GPU 热身 (Warm-up) ---
-		// 强制触发一次推理，让 TensorRT 将 Engine 加载到显存，避免第一次走棋卡顿
-		log.Println("  - Warming up GPU sessions...")
-		_ = katagoSess.Run()
-		_ = katagoSessBatch.Run()
-		log.Println("  - GPU sessions warmed up.")
-		// -------------------------------
+		var strategies []strategy
+		if runtime.GOOS == "darwin" {
+			strategies = []strategy{
+				{"CoreML", func(so *ort.SessionOptions) error {
+					return so.AppendExecutionProviderCoreMLV2(map[string]string{"use_ane": "1"})
+				}},
+				{"CPU", func(so *ort.SessionOptions) error { return nil }},
+			}
+		} else if runtime.GOOS == "windows" {
+			strategies = []strategy{
+				{"TensorRT", func(so *ort.SessionOptions) error {
+					trtOpts, e := ort.NewTensorRTProviderOptions()
+					if e != nil {
+						return e
+					}
+					defer trtOpts.Destroy()
+					// 显式设置配置以确保缓存复用
+					trtOpts.Update(map[string]string{
+						"device_id":               "0",
+						"trt_engine_cache_enable": "1",
+						"trt_engine_cache_path":   absCachePath,
+						"trt_fp16_enable":         "1",
+						"trt_max_workspace_size":  "2147483648",
+						"trt_timing_cache_enable": "1",
+						"trt_timing_cache_path":   absCachePath,
+					})
+					return so.AppendExecutionProviderTensorRT(trtOpts)
+				}},
+				{"CUDA", func(so *ort.SessionOptions) error {
+					cudaOpts, e := ort.NewCUDAProviderOptions()
+					if e != nil {
+						return e
+					}
+					defer cudaOpts.Destroy()
+					return so.AppendExecutionProviderCUDA(cudaOpts)
+				}},
+				{"DirectML", func(so *ort.SessionOptions) error {
+					return so.AppendExecutionProviderDirectML(0)
+				}},
+				{"CPU", func(so *ort.SessionOptions) error { return nil }},
+			}
+		} else {
+			// Linux or other
+			strategies = []strategy{
+				{"TensorRT", func(so *ort.SessionOptions) error {
+					if trtOpts, e := ort.NewTensorRTProviderOptions(); e == nil {
+						defer trtOpts.Destroy()
+						trtOpts.Update(map[string]string{
+							"device_id":               "0",
+							"trt_engine_cache_enable": "1",
+							"trt_engine_cache_path":   absCachePath,
+							"trt_fp16_enable":         "1",
+							"trt_max_workspace_size":  "2147483648",
+							"trt_timing_cache_enable": "1",
+							"trt_timing_cache_path":   absCachePath,
+						})
+						return so.AppendExecutionProviderTensorRT(trtOpts)
+					}
+					return fmt.Errorf("TensorRT options creation failed")
+				}},
+				{"CUDA", func(so *ort.SessionOptions) error {
+					if cudaOpts, e := ort.NewCUDAProviderOptions(); e == nil {
+						defer cudaOpts.Destroy()
+						return so.AppendExecutionProviderCUDA(cudaOpts)
+					}
+					return fmt.Errorf("CUDA options creation failed")
+				}},
+				{"CPU", func(so *ort.SessionOptions) error { return nil }},
+			}
+		}
+
+		var success bool
+		for _, st := range strategies {
+			log.Printf("[katago] Attempting to initialize with %s...%s", st.name, ansiReset)
+
+			so, err := ort.NewSessionOptions()
+			if err != nil {
+				continue
+			}
+			// 设置日志级别为 Error (3)，避免输出警告和信息，防止变红
+			_ = so.SetLogSeverityLevel(3)
+
+			if err := st.setup(so); err != nil {
+				log.Printf("[katago] %s setup failed: %v%s", st.name, err, ansiReset)
+				so.Destroy()
+				continue
+			}
+
+			// 尝试创建会话
+			s1, err1 := ort.NewAdvancedSessionWithONNXData(
+				modelData,
+				[]string{katagoInputSpatial, katagoInputGlobal},
+				[]string{katagoOutputPolicy, katagoOutputValue},
+				[]ort.Value{katagoInSpatial, katagoInGlobal},
+				[]ort.Value{katagoOutPolicy, katagoOutValue},
+				so,
+			)
+			if err1 != nil {
+				log.Printf("[katago] %s session creation failed: %v%s", st.name, err1, ansiReset)
+				so.Destroy()
+				continue
+			}
+
+			s2, err2 := ort.NewAdvancedSessionWithONNXData(
+				modelData,
+				[]string{katagoInputSpatial, katagoInputGlobal},
+				[]string{katagoOutputPolicy, katagoOutputValue},
+				[]ort.Value{katagoInSpatialB, katagoInGlobalB},
+				[]ort.Value{katagoOutPolicyB, katagoOutValueB},
+				so,
+			)
+			if err2 != nil {
+				log.Printf("[katago] %s batch session creation failed: %v%s", st.name, err2, ansiReset)
+				s1.Destroy()
+				so.Destroy()
+				continue
+			}
+
+			// 热身
+			log.Printf("[katago] Warming up %s...%s", st.name, ansiReset)
+			if errR1 := s1.Run(); errR1 != nil {
+				log.Printf("[katago] %s warm-up 1 failed: %v%s", st.name, errR1, ansiReset)
+				s1.Destroy()
+				s2.Destroy()
+				so.Destroy()
+				continue
+			}
+			if errR2 := s2.Run(); errR2 != nil {
+				log.Printf("[katago] %s warm-up 2 failed: %v%s", st.name, errR2, ansiReset)
+				s1.Destroy()
+				s2.Destroy()
+				so.Destroy()
+				continue
+			}
+
+			// 成功！
+			katagoSess = s1
+			katagoSessBatch = s2
+			katagoErr = nil
+			success = true
+			log.Printf("[katago] Successfully initialized with %s.%s", st.name, ansiReset)
+			so.Destroy()
+			break
+		}
+
+		if !success {
+			katagoErr = fmt.Errorf("failed to initialize KataGo ONNX with any strategy")
+		}
 	})
 	return katagoErr
 }
@@ -503,11 +591,11 @@ func KataValueScoreWithSelection(b *Board, me CellState, selectedIdx int) (int, 
 // PreloadModels 预加载模型，触发 TensorRT 编译或加载缓存
 func PreloadModels() {
 	go func() {
-		log.Println("[katago] Preloading models and initializing ONNX session...")
+		log.Printf("[katago] Preloading models and initializing ONNX session...%s", ansiReset)
 		if err := ensureKataONNX(); err != nil {
-			log.Printf("[katago] Model preloading failed: %v", err)
+			log.Printf("[katago] Model preloading failed: %v%s", err, ansiReset)
 		} else {
-			log.Println("[katago] Model preloading complete.")
+			log.Printf("[katago] Model preloading complete.%s", ansiReset)
 		}
 	}()
 }
