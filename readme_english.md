@@ -6,6 +6,12 @@ Hexxagon Go is a high-performance implementation of the **Hexxagon** board game 
 
 Hexxagon is a strategic game played on a 61-cell hexagonal grid.
 
+## 📺 Game Demonstration
+
+<div align="center">
+  <video src="demo_github.mp4" width="600" controls muted autoplay loop></video>
+</div>
+
 ### 1. Board and Pieces
 - The board consists of 61 hexagonal cells (radius 4).
 - Two players compete using Red and White pieces.
